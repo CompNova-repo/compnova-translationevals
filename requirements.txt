@@ -1,0 +1,8 @@
+streamlit
+pandas
+openai-whisper
+unbabel-comet
+transformers
+torch
+huggingface_hub
+sentencepiece
