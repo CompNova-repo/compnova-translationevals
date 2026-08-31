@@ -9,3 +9,4 @@ sentencepiece
 librosa
 soundfile
 gTTS
+git+https://github.com/google-research/metricx.git
