@@ -6,3 +6,6 @@ transformers
 torch
 huggingface_hub
 sentencepiece
+librosa
+soundfile
+gTTS
