@@ -33,6 +33,35 @@ if HF_TOKEN:
         st.warning(f"Hugging Face login failed: {e}")
 
 # =========================================================
+# 0b. METRICX REPO (research code, not on PyPI)
+# =========================================================
+# google-research/metricx has no setup.py / pyproject.toml, so it can't be
+# pip-installed. We clone it on first launch and run its scripts directly.
+METRICX_REPO_URL = "https://github.com/google-research/metricx.git"
+METRICX_PINNED_COMMIT = "fc4978eb064670f7cc33e93ea4f52d38396b8ae6"
+
+
+def _ensure_metricx_repo():
+    if os.path.isdir(os.path.join("metricx", ".git")) or os.path.exists(os.path.join("metricx", "metricx24", "predict.py")):
+        return
+    try:
+        st.info("Cloning google-research/metricx (one-time)…")
+        subprocess.run(
+            ["git", "clone", METRICX_REPO_URL, "metricx"],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-C", "metricx", "checkout", METRICX_PINNED_COMMIT],
+            check=True, capture_output=True, text=True,
+        )
+    except Exception as e:
+        st.warning(f"Could not clone metricx repo automatically ({e}). "
+                   "Make sure 'metricx/' exists next to DemoApp.py.")
+
+
+_ensure_metricx_repo()
+
+# =========================================================
 # 1. CACHED MODEL LOADERS
 # =========================================================
 
