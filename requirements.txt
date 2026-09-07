@@ -1,11 +1,12 @@
 streamlit
 pandas
-openai-whisper
+faster-whisper
 unbabel-comet
 transformers
 torch
 huggingface_hub
 sentencepiece
+scipy
 librosa
 soundfile
 gTTS

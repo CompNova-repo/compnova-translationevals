@@ -131,25 +131,116 @@ def load_comet():
     model_path = download_model("Unbabel/wmt22-cometkiwi-da")
     return load_from_checkpoint(model_path)
 
-@st.cache_resource(show_spinner="Loading Sentiment & Emotion Models...")
-def load_nlp_pipelines():
-    from transformers import pipeline, AutoTokenizer
-    senti_pipe = pipeline("text-classification", model="tabularisai/multilingual-sentiment-analysis")
-    tokenizer = AutoTokenizer.from_pretrained("FacebookAI/xlm-roberta-base", use_fast=False)
-    emot_pipe = pipeline(
-        "text-classification",
-        model="tabularisai/multilingual-emotion-classification",
-        tokenizer=tokenizer,
-        function_to_apply="sigmoid",
-        top_k=None,
+@st.cache_resource(show_spinner="Loading Speech Emotion Recognition Model...")
+def load_audio_emotion_pipeline():
+    """Load the Wav2Vec2-XLSR SER model that classifies 8 emotions from audio.
+
+    Replaces the legacy text-based ``tabularisai`` classifiers with an audio
+    classifier that operates on the raw waveform. We **don't** use the
+    high-level ``transformers.pipeline`` because on this checkpoint it
+    silently drops the trained classifier head (the published weights were
+    saved under the old ``dense`` + ``output`` two-layer head from
+    ``transformers 4.8.2``; current ``Wav2Vec2ForSequenceClassification``
+    uses a single ``classifier`` Linear and re-initialises the head with
+    random weights, producing near-uniform outputs).
+
+    Instead we assemble the backbone via ``Wav2Vec2Model.from_pretrained``
+    and rebuild the matching ``dense`` + ``tanh`` + ``dropout`` +
+    ``out_proj`` head, then patch the head weights in by hand from the
+    saved checkpoint.
+
+    Returns ``(feature_extractor, model, id2label)``; ``do_audio_emotion``
+    runs them manually and applies ``softmax`` over the logits so the
+    output shape matches what the pipeline would have produced.
+    """
+    import torch
+    import torch.nn as nn
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from transformers import AutoFeatureExtractor, Wav2Vec2Model
+
+    model_name = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+    backbone = Wav2Vec2Model.from_pretrained(model_name)
+    cfg = backbone.config
+    dropout_p = getattr(cfg, "final_dropout", 0.1)
+    hidden_size = cfg.hidden_size
+
+    # Old-style classifier head: ``dense`` (Linear + tanh) → ``out_proj``
+    # (Linear). Implemented as an ``nn.Sequential`` so ``state_dict`` keys
+    # line up predictably: index 0 = dense, index 1 = tanh (no params),
+    # index 2 = dropout (no params), index 3 = out_proj.
+    classifier = nn.Sequential(
+        nn.Linear(hidden_size, hidden_size),
+        nn.Tanh(),
+        nn.Dropout(dropout_p),
+        nn.Linear(hidden_size, len(SER_LABELS)),
     )
-    return senti_pipe, emot_pipe
+
+    class _SERModel(nn.Module):
+        def __init__(self, backbone, classifier):
+            super().__init__()
+            self.backbone = backbone
+            self.classifier = classifier
+
+        def forward(self, input_values, attention_mask=None):
+            outputs = self.backbone(
+                input_values, attention_mask=attention_mask
+            )
+            hidden = outputs.last_hidden_state  # (B, T, H)
+            # Hidden is at the backbone output time-resolution
+            # (post-conv downsampling), so the input-time attention_mask
+            # cannot be applied directly. For single-clip inference we
+            # mean-pool across the full sequence.
+            pooled = hidden.mean(dim=1)
+            return self.classifier(pooled)
+
+    model = _SERModel(backbone, classifier)
+
+    # Pull the saved head weights straight from the checkpoint and copy
+    # them into our rebuilt head. Keys in the file are
+    # ``classifier.dense.*`` and ``classifier.output.*``; we rename
+    # ``output`` → index 3 of the Sequential.
+    try:
+        weights_path = hf_hub_download(
+            repo_id=model_name, filename="model.safetensors"
+        )
+        state = load_file(weights_path)
+        head_weights = {}
+        for k, v in state.items():
+            if not k.startswith("classifier."):
+                continue
+            suffix = k[len("classifier."):]
+            if suffix.startswith("dense."):
+                head_weights["0." + suffix[len("dense."):]] = v
+            elif suffix.startswith("output."):
+                head_weights["3." + suffix[len("output."):]] = v
+        missing, unexpected = classifier.load_state_dict(
+            head_weights, strict=False
+        )
+        # We expect no missing keys (the Sequential has 4 modules, indices
+        # 0 and 3 carry weights). Log unexpected for visibility.
+        if unexpected:
+            st.info(
+                f"SER: {len(unexpected)} unexpected head keys in "
+                f"checkpoint (e.g. {unexpected[0]!r})."
+            )
+    except Exception as e:
+        st.warning(
+            f"SER head could not be patched from checkpoint ({e}). "
+            "Predictions will be near-uniform."
+        )
+
+    model.eval()
+    id2label = {i: lbl for i, lbl in enumerate(SER_LABELS)}
+    return feature_extractor, model, id2label
 
 # Initialize default models into cache
 processor, m4tmodel, translation_device = load_seamless_model()
 whisper_model = load_whisper()
 comet_model = load_comet()
-sentiment_pipeline, emotion_pipeline = load_nlp_pipelines()
+audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = load_audio_emotion_pipeline()
 nllb_tokenizer, nllb_model = load_nllb_model()
 
 # =========================================================
@@ -318,11 +409,65 @@ def do_metricx_eval(src_text: str, mt_text: str) -> float:
         st.warning(f"MetricX failed: {e}")
         return None
 
-def do_sentiment(src_text: str, mt_text: str):
-    return sentiment_pipeline([src_text, mt_text])
+# Canonical 8-class label set returned by the wav2vec2 SER model.
+# Kept in this fixed order so cosine similarity is computed against the
+# same axis for every pair of source / target predictions.
+SER_LABELS = [
+    "angry", "calm", "disgust", "fearful",
+    "happy", "neutral", "sad", "surprised",
+]
 
-def do_emotion(src_text: str, mt_text: str):
-    return emotion_pipeline([src_text, mt_text])
+
+def do_audio_emotion(audio_path: str):
+    """Run Speech Emotion Recognition directly on an audio waveform.
+
+    Loads the file with ``librosa`` at 16 kHz mono (the sampling rate the
+    wav2vec2 backbone expects), passes the waveform through the cached
+    ``AutoFeatureExtractor`` + custom backbone-plus-head module from
+    ``load_audio_emotion_pipeline``, applies ``softmax`` over the logits,
+    and returns ``[{"label": str, "score": float}, ...]`` sorted
+    high-to-low.
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        return []
+    try:
+        # librosa.load returns float32 mono audio at the requested rate.
+        waveform, _ = librosa.load(audio_path, sr=16000, mono=True)
+        inputs = audio_emotion_proc(
+            waveform, sampling_rate=16000, return_tensors="pt"
+        )
+        with torch.no_grad():
+            logits = audio_emotion_model(**inputs)
+        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+        preds = [
+            {"label": audio_emotion_id2label[i], "score": float(p)}
+            for i, p in enumerate(probs)
+        ]
+        return sorted(preds, key=lambda x: x["score"], reverse=True)
+    except Exception as e:
+        st.warning(
+            f"Audio emotion inference failed for {os.path.basename(audio_path)}: {e}"
+        )
+        return []
+
+
+def compute_affective_match_score(src_preds, mt_preds) -> float:
+    """Cosine similarity of two SER distributions over ``SER_LABELS``.
+
+    An exact top-1 match (with otherwise identical distributions) yields
+    ~1.0. Returns 0.0 if either side is missing or degenerate.
+    """
+    if not src_preds or not mt_preds:
+        return 0.0
+    src_map = {p["label"]: float(p["score"]) for p in src_preds}
+    mt_map  = {p["label"]: float(p["score"]) for p in mt_preds}
+    p = np.array([src_map.get(lbl, 0.0) for lbl in SER_LABELS])
+    q = np.array([mt_map.get(lbl,  0.0) for lbl in SER_LABELS])
+    p_norm = float(np.linalg.norm(p))
+    q_norm = float(np.linalg.norm(q))
+    if p_norm == 0.0 or q_norm == 0.0:
+        return 0.0
+    return float(np.dot(p, q) / (p_norm * q_norm))
 
 # =========================================================
 # 2.5 INITIALIZE SESSION STATE FOR HISTORY
@@ -335,7 +480,7 @@ if "eval_history" not in st.session_state:
 # =========================================================
 
 st.title("🎙️ Speech-to-Speech Translation & Quality Evaluation")
-st.markdown("Compare direct vs cascaded translation architectures and evaluate quality estimation, sentiment, and emotion preservation.")
+st.markdown("Compare direct vs cascaded translation architectures and evaluate translation quality together with affective / acoustic tone preservation (Speech Emotion Recognition over the audio waveforms).")
 
 # Initialize the Tabs
 tab_main, tab_history = st.tabs(["🔍 Translation & Eval", "📜 Run History"])
@@ -440,11 +585,15 @@ with tab_main:
                         mt_text = do_transcribe(mt_audio_path)
 
                 # --- Step 2: Quality & Paralinguistic Evaluation ---
-                with st.status("Calculating quality, sentiment, and emotion metrics...", expanded=False):
+                with st.status(
+                    "Calculating quality and affective (audio emotion) metrics...",
+                    expanded=False,
+                ):
                     comet_score = do_cometeval(src_text, mt_text)
                     metricx_score = do_metricx_eval(src_text, mt_text)
-                    senti_results = do_sentiment(src_text, mt_text)
-                    emot_results = do_emotion(src_text, mt_text)
+                    src_emotion = do_audio_emotion(src_audio_path)
+                    mt_emotion  = do_audio_emotion(mt_audio_path)
+                    affective_match = compute_affective_match_score(src_emotion, mt_emotion)
 
             st.success("Workflow Complete!")
 
@@ -476,21 +625,55 @@ with tab_main:
             m_col1.metric("COMET-Kiwi Score", f"{comet_score}")
             m_col2.metric("MetricX-24 QE Score", f"{metricx_score}" if metricx_score is not None else "N/A")
 
-            st.subheader("🎭 Sentiment & Emotion Alignment")
-            s_col1, s_col2 = st.columns(2)
-            with s_col1:
-                st.markdown("**Source Paralinguistics**")
-                st.write(f"- **Sentiment:** `{senti_results[0]['label']}` ({senti_results[0]['score']:.1%})")
-                top_src_emotions = sorted(emot_results[0], key=lambda x: x['score'], reverse=True)[:3]
-                st.write("- **Top Emotions:** " + ", ".join([f"{e['label']} ({e['score']:.1%})" for e in top_src_emotions]))
-            with s_col2:
-                st.markdown("**Translated Paralinguistics**")
-                st.write(f"- **Sentiment:** `{senti_results[1]['label']}` ({senti_results[1]['score']:.1%})")
-                top_mt_emotions = sorted(emot_results[1], key=lambda x: x['score'], reverse=True)[:3]
-                st.write("- **Top Emotions:** " + ", ".join([f"{e['label']} ({e['score']:.1%})" for e in top_mt_emotions]))
-                
-            top_src_emotion = sorted(emot_results[0], key=lambda x: x['score'], reverse=True)[0]['label']
-            top_mt_emotion = sorted(emot_results[1], key=lambda x: x['score'], reverse=True)[0]['label']
+            st.subheader("🎭 Affective & Acoustic Tone Alignment")
+            ae_col1, ae_col2, ae_col3 = st.columns(3)
+            top_src = src_emotion[0] if src_emotion else {"label": "n/a", "score": 0.0}
+            top_mt  = mt_emotion[0]  if mt_emotion  else {"label": "n/a", "score": 0.0}
+            with ae_col1:
+                st.markdown("**Source Audio Emotion**")
+                st.markdown(
+                    f"<div style='font-size:1.35em;font-weight:600'>{top_src['label']}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<span style='background:#e6f4ff;color:#003a8c;padding:2px 8px;"
+                    f"border-radius:8px;font-size:0.85em'>confidence {top_src['score']:.1%}</span>",
+                    unsafe_allow_html=True,
+                )
+                if len(src_emotion) > 1:
+                    runner_ups = ", ".join(
+                        f"{p['label']} ({p['score']:.1%})"
+                        for p in src_emotion[1:4]
+                    )
+                    st.caption(f"Runner-ups: {runner_ups}")
+            with ae_col2:
+                st.markdown("**Target Audio Emotion**")
+                st.markdown(
+                    f"<div style='font-size:1.35em;font-weight:600'>{top_mt['label']}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<span style='background:#fff4e6;color:#7a4a00;padding:2px 8px;"
+                    f"border-radius:8px;font-size:0.85em'>confidence {top_mt['score']:.1%}</span>",
+                    unsafe_allow_html=True,
+                )
+                if len(mt_emotion) > 1:
+                    runner_ups = ", ".join(
+                        f"{p['label']} ({p['score']:.1%})"
+                        for p in mt_emotion[1:4]
+                    )
+                    st.caption(f"Runner-ups: {runner_ups}")
+            with ae_col3:
+                st.markdown("**Affective / Acoustic Tone Match**")
+                st.metric("Match %", f"{affective_match:.1%}")
+                match_top1 = (
+                    top_src["label"] == top_mt["label"]
+                    and top_src["label"] != "n/a"
+                )
+                st.caption(
+                    "Top-1 label match: ✅"
+                    if match_top1 else "Top-1 label match: ❌"
+                )
 
             record = {
                 "Workflow": mode,
@@ -502,10 +685,9 @@ with tab_main:
                 "Translated Text": mt_text,
                 "COMET-Kiwi": comet_score,
                 "MetricX-24": metricx_score,
-                "Source Sentiment": senti_results[0]['label'],
-                "Translated Sentiment": senti_results[1]['label'],
-                "Source Emotion": top_src_emotion,
-                "Translated Emotion": top_mt_emotion 
+                "Source Audio Emotion": top_src["label"],
+                "Target Audio Emotion": top_mt["label"],
+                "Affective Match Score": round(affective_match, 4),
             }
             st.session_state.eval_history.append(record)
 
