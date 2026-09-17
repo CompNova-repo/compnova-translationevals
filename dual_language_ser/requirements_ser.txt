@@ -2,7 +2,9 @@
 torch>=2.2,<3
 torchaudio>=2.2,<3
 funasr==1.4.15
+faster-whisper>=1.1,<2
 huggingface-hub>=0.23,<2
 librosa>=0.10.2,<1
 numpy>=1.26,<3
+sentence-transformers>=3,<6
 soundfile>=0.12,<1
