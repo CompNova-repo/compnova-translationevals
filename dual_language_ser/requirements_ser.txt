@@ -1,0 +1,8 @@
+# For GPU use, install the matching PyTorch build first from pytorch.org.
+torch>=2.2,<3
+torchaudio>=2.2,<3
+funasr==1.4.15
+huggingface-hub>=0.23,<2
+librosa>=0.10.2,<1
+numpy>=1.26,<3
+soundfile>=0.12,<1
