@@ -718,13 +718,20 @@ with tab_main:
 
                 # --- Step 2: Whole-clip quality (+ SER if enabled) ---
                 status_label = (
-                    "Calculating whole-clip quality and affective metrics..."
+                    "Calculating affective metrics..."
                     if ENABLE_SER else
-                    "Calculating whole-clip quality metrics..."
+                    "Preparing evaluation..."
                 )
                 with st.status(status_label, expanded=False):
-                    comet_score = do_cometeval(src_text, mt_text)
-                    metricx_score = do_metricx_eval(src_text, mt_text)
+                    # Whole-clip COMET/MetricX are NOT computed separately
+                    # here - that would mean loading MetricX's 2.46GB model
+                    # from a fresh subprocess TWICE per run (once here, once
+                    # again for the chunk batch below). The chunk-level
+                    # average, computed once, is used as the headline number
+                    # instead - it's also a more honest summary of a
+                    # multi-sentence clip than one big-blob score anyway
+                    # (see project notes on why whole-clip scoring on long
+                    # audio produces out-of-domain, less meaningful numbers).
                     if ENABLE_SER:
                         src_emotion = do_audio_emotion(src_audio_path)
                         mt_emotion  = do_audio_emotion(mt_audio_path)
@@ -773,33 +780,34 @@ with tab_main:
 
             st.divider()
 
-            st.subheader("📊 Whole-Clip Translation Quality")
-            m_col1, m_col2 = st.columns(2)
-            m_col1.metric("COMET-Kiwi Score", f"{comet_score}")
-            m_col2.metric("MetricX-24 QE Score", f"{metricx_score}" if metricx_score is not None else "N/A")
-            st.caption("Full transcript scored as a single input - useful as a headline number, but see the sentence-level breakdown below for where quality actually varies across the clip.")
-
             st.divider()
 
-            st.subheader("📈 Sentence-Level Quality Over the Clip")
-            st.caption(
-                "COMET-Kiwi and MetricX-24 scored per aligned chunk, both shown on the "
-                "same 0-1 scale (1 = good). MetricX (natively 0-25, lower = better) is "
-                "normalised here as 1 - score/25 so the two lines are directly comparable. "
-                "Hover a point to see the sentence pair it corresponds to."
-            )
+            st.subheader("📊 Translation Quality")
             if not chunk_pairs:
                 st.warning("No chunk pairs could be aligned for this clip (too short, or no acceptable semantic match found).")
+                comet_score, metricx_score = None, None
             else:
-                fig = build_metrics_comparison_chart(chunk_pairs, chunk_comet_scores, chunk_metricx_scores)
-                st.plotly_chart(fig, use_container_width=True)
-
                 c_comet_avg = sum(chunk_comet_scores) / len(chunk_comet_scores) if chunk_comet_scores else None
                 c_metricx_avg = sum(chunk_metricx_scores) / len(chunk_metricx_scores) if chunk_metricx_scores else None
+                # Used as the headline numbers (see note above on why we
+                # don't ALSO run a separate whole-clip MetricX pass).
+                comet_score = round(c_comet_avg, 4) if c_comet_avg is not None else None
+                metricx_score = round(c_metricx_avg, 4) if c_metricx_avg is not None else None
+
                 cc1, cc2, cc3 = st.columns(3)
                 cc1.metric("Chunks aligned", f"{len(chunk_pairs)}")
-                cc2.metric("Avg COMET-Kiwi (chunked)", f"{c_comet_avg:.3f}" if c_comet_avg is not None else "N/A")
-                cc3.metric("Avg MetricX-24 (chunked)", f"{c_metricx_avg:.3f}" if c_metricx_avg is not None else "N/A")
+                cc2.metric("Avg COMET-Kiwi", f"{c_comet_avg:.3f}" if c_comet_avg is not None else "N/A")
+                cc3.metric("Avg MetricX-24", f"{c_metricx_avg:.3f}" if c_metricx_avg is not None else "N/A")
+
+                st.caption(
+                    "📈 Sentence-Level Quality Over the Clip — COMET-Kiwi and MetricX-24 "
+                    "scored per aligned chunk, both shown on the same 0-1 scale (1 = good). "
+                    "MetricX (natively 0-25, lower = better) is normalised here as "
+                    "1 - score/25 so the two lines are directly comparable. Hover a point "
+                    "to see the sentence pair it corresponds to."
+                )
+                fig = build_metrics_comparison_chart(chunk_pairs, chunk_comet_scores, chunk_metricx_scores)
+                st.plotly_chart(fig, use_container_width=True)
 
                 if unmatched_src or unmatched_mt:
                     with st.expander(
