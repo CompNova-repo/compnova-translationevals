@@ -1,4 +1,8 @@
 import os
+
+os.environ["USE_TF"] = "NO"
+os.environ["USE_JAX"] = "NO"
+
 import sys
 import json
 import tempfile
@@ -11,6 +15,24 @@ import librosa
 import torch
 from gtts import gTTS
 import faster_whisper
+
+# Canonical 8-class label set returned by the wav2vec2 SER model. Defined
+# here, near the top, because load_audio_emotion_pipeline() references it
+# at MODULE LOAD TIME (models are initialized eagerly, not lazily).
+SER_LABELS = [
+    "angry", "calm", "disgust", "fearful",
+    "happy", "neutral", "sad", "surprised",
+]
+
+# Speech Emotion Recognition is on hold: the current model
+# (ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition) is trained
+# on English-only speech, and applying it to non-English target audio
+# gives unreliable results (confirmed via cross-lingual SER research -
+# same-language accuracy ~0.93 vs cross-language ~0.46 in published
+# benchmarks). Flip this back to True once a genuinely multilingual SER
+# model is in place. When False, no SER model is loaded, no audio
+# emotion inference runs, and the affective-match UI section is hidden.
+ENABLE_SER = False
 
 # =========================================================
 # 0. STREAMLIT PAGE CONFIG & HF AUTHENTICATION
@@ -73,23 +95,6 @@ def load_seamless_model():
     m4tmodel = SeamlessM4TModel.from_pretrained("facebook/hf-seamless-m4t-medium").to(device)
     return processor, m4tmodel, device
 
-# hy mt, requires newer transformers version
-# @st.cache_resource(show_spinner="Loading HY-MT1.5-1.8B Text Translation Model...")
-# def load_hy_mt_model():
-#     from transformers import AutoTokenizer, AutoModelForCausalLM
-#     tokenizer = AutoTokenizer.from_pretrained("tencent/HY-MT1.5-1.8B")
-    
-#     # Use bfloat16 to save memory if running on GPU
-#     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-#     model = AutoModelForCausalLM.from_pretrained(
-#         "tencent/HY-MT1.5-1.8B",
-#         torch_dtype=dtype,
-#         device_map="auto" if torch.cuda.is_available() else None
-#     )
-#     if not torch.cuda.is_available():
-#         model = model.to("cpu")
-#     return tokenizer, model
-
 @st.cache_resource(show_spinner="Loading NLLB-200 Text Translation Model...")
 def load_nllb_model():
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -107,22 +112,14 @@ def load_nllb_model():
     
     return tokenizer, model
 
-# slow whisper model
-# @st.cache_resource(show_spinner="Loading Whisper ASR Model...")
-# def load_whisper():
-#     import whisper
-#     return whisper.load_model("large")
-
 @st.cache_resource(show_spinner="Loading Faster-Whisper Turbo...")
 def load_whisper():
     from faster_whisper import WhisperModel
     import torch
     
-    # Automatically use GPU and FP16 (16-bit float) if available for massive speedups
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if torch.cuda.is_available() else "int8"
     
-    # Load the highly optimized 'turbo' model
     return WhisperModel("large-v3-turbo", device=device, compute_type=compute_type)
 
 @st.cache_resource(show_spinner="Loading COMET-Kiwi Model...")
@@ -131,27 +128,31 @@ def load_comet():
     model_path = download_model("Unbabel/wmt22-cometkiwi-da")
     return load_from_checkpoint(model_path)
 
+@st.cache_resource(show_spinner="Loading LaBSE alignment model...")
+def load_alignment_model():
+    """Multilingual sentence embedder used to align source and translation
+    chunks by MEANING rather than by list position. LaBSE is trained
+    specifically for cross-lingual sentence matching (109 languages)."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("sentence-transformers/LaBSE")
+
+@st.cache_resource(show_spinner="Loading 5-class sentiment model...")
+def load_sentiment_model():
+    """Text-based 5-class sentiment classifier (Very Negative / Negative /
+    Neutral / Positive / Very Positive), run per aligned chunk pair.
+    NOTE: this reads the transcript text only, not vocal tone/delivery -
+    two sentences that read identically but were SPOKEN with very
+    different emotion will get the same label here. That's a known,
+    confirmed limitation (see project notes), not a bug."""
+    from transformers import pipeline
+    return pipeline("text-classification", model="tabularisai/multilingual-sentiment-analysis")
+
 @st.cache_resource(show_spinner="Loading Speech Emotion Recognition Model...")
 def load_audio_emotion_pipeline():
     """Load the Wav2Vec2-XLSR SER model that classifies 8 emotions from audio.
 
-    Replaces the legacy text-based ``tabularisai`` classifiers with an audio
-    classifier that operates on the raw waveform. We **don't** use the
-    high-level ``transformers.pipeline`` because on this checkpoint it
-    silently drops the trained classifier head (the published weights were
-    saved under the old ``dense`` + ``output`` two-layer head from
-    ``transformers 4.8.2``; current ``Wav2Vec2ForSequenceClassification``
-    uses a single ``classifier`` Linear and re-initialises the head with
-    random weights, producing near-uniform outputs).
-
-    Instead we assemble the backbone via ``Wav2Vec2Model.from_pretrained``
-    and rebuild the matching ``dense`` + ``tanh`` + ``dropout`` +
-    ``out_proj`` head, then patch the head weights in by hand from the
-    saved checkpoint.
-
-    Returns ``(feature_extractor, model, id2label)``; ``do_audio_emotion``
-    runs them manually and applies ``softmax`` over the logits so the
-    output shape matches what the pipeline would have produced.
+    NOTE: not called while ENABLE_SER is False - see the flag near the
+    top of this file.
     """
     import torch
     import torch.nn as nn
@@ -167,10 +168,6 @@ def load_audio_emotion_pipeline():
     dropout_p = getattr(cfg, "final_dropout", 0.1)
     hidden_size = cfg.hidden_size
 
-    # Old-style classifier head: ``dense`` (Linear + tanh) → ``out_proj``
-    # (Linear). Implemented as an ``nn.Sequential`` so ``state_dict`` keys
-    # line up predictably: index 0 = dense, index 1 = tanh (no params),
-    # index 2 = dropout (no params), index 3 = out_proj.
     classifier = nn.Sequential(
         nn.Linear(hidden_size, hidden_size),
         nn.Tanh(),
@@ -188,20 +185,12 @@ def load_audio_emotion_pipeline():
             outputs = self.backbone(
                 input_values, attention_mask=attention_mask
             )
-            hidden = outputs.last_hidden_state  # (B, T, H)
-            # Hidden is at the backbone output time-resolution
-            # (post-conv downsampling), so the input-time attention_mask
-            # cannot be applied directly. For single-clip inference we
-            # mean-pool across the full sequence.
+            hidden = outputs.last_hidden_state
             pooled = hidden.mean(dim=1)
             return self.classifier(pooled)
 
     model = _SERModel(backbone, classifier)
 
-    # Pull the saved head weights straight from the checkpoint and copy
-    # them into our rebuilt head. Keys in the file are
-    # ``classifier.dense.*`` and ``classifier.output.*``; we rename
-    # ``output`` → index 3 of the Sequential.
     try:
         weights_path = hf_hub_download(
             repo_id=model_name, filename="model.safetensors"
@@ -219,8 +208,6 @@ def load_audio_emotion_pipeline():
         missing, unexpected = classifier.load_state_dict(
             head_weights, strict=False
         )
-        # We expect no missing keys (the Sequential has 4 modules, indices
-        # 0 and 3 carry weights). Log unexpected for visibility.
         if unexpected:
             st.info(
                 f"SER: {len(unexpected)} unexpected head keys in "
@@ -240,7 +227,12 @@ def load_audio_emotion_pipeline():
 processor, m4tmodel, translation_device = load_seamless_model()
 whisper_model = load_whisper()
 comet_model = load_comet()
-audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = load_audio_emotion_pipeline()
+align_model = load_alignment_model()
+sentiment_pipeline = load_sentiment_model()
+if ENABLE_SER:
+    audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = load_audio_emotion_pipeline()
+else:
+    audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = None, None, None
 nllb_tokenizer, nllb_model = load_nllb_model()
 
 # =========================================================
@@ -258,7 +250,7 @@ def save_temp_file(uploaded_file) -> str:
 def generate_seamless_audio(source_filepath: str, target_lang_code: str) -> str:
     """End-to-End S2ST translation via SeamlessM4T."""
     audio_array, _ = librosa.load(source_filepath, sr=16000)
-    audio_inputs = processor(audios=audio_array, sampling_rate=16000, return_tensors="pt").to(translation_device)
+    audio_inputs = processor(audio=audio_array, sampling_rate=16000, return_tensors="pt").to(translation_device)
     
     with torch.no_grad():
         output_tokens = m4tmodel.generate(
@@ -272,42 +264,10 @@ def generate_seamless_audio(source_filepath: str, target_lang_code: str) -> str:
     sf.write(temp_out.name, output_audio_array, m4tmodel.config.sampling_rate)
     return temp_out.name
 
-# def generate_hy_mt_translation(source_text: str, target_lang: str) -> str:
-#     """Text-to-Text translation via Tencent HY-MT1.5-1.8B."""
-#     tokenizer, model = load_hy_mt_model()
-    
-#     # Map 3-letter UI codes to full language names for the Hunyuan prompt
-#     lang_names = {
-#         "spa": "Spanish", "fra": "French", "deu": "German", 
-#         "cmn": "Chinese", "ita": "Italian", "por": "Portuguese", "jpn": "Japanese"
-#     }
-#     target_name = lang_names.get(target_lang, "English")
-    
-#     prompt = f"Translate the following segment into {target_name}, without additional explanation.\n{source_text}"
-#     messages = [{"role": "user", "content": prompt}]
-    
-#     tokenized_chat = tokenizer.apply_chat_template(
-#         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
-#     ).to(model.device)
-    
-#     outputs = model.generate(
-#         tokenized_chat, 
-#         max_new_tokens=512,
-#         top_k=20, 
-#         top_p=0.6, 
-#         repetition_penalty=1.05, 
-#         temperature=0.7
-#     )
-    
-#     input_length = tokenized_chat.shape[1]
-#     output_text = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
-#     return output_text.strip()
-
 def generate_nllb_translation(source_text: str, target_lang: str) -> str:
     """Text-to-Text translation via Meta NLLB-200."""
     tokenizer, model = nllb_tokenizer, nllb_model
     
-    # NLLB uses specific BCP-47 codes (Language_Script)
     nllb_lang_map = {
         "spa": "spa_Latn",
         "fra": "fra_Latn",
@@ -319,20 +279,15 @@ def generate_nllb_translation(source_text: str, target_lang: str) -> str:
     }
     target_nllb_code = nllb_lang_map.get(target_lang, "eng_Latn")
     
-    # 1. Tokenize the input text
     inputs = tokenizer(source_text, return_tensors="pt").to(model.device)
-    
-    # 2. Grab the specific ID for the target language to force the model to translate to it
     target_lang_id = tokenizer.lang_code_to_id[target_nllb_code]
     
-    # 3. Generate the translation
     outputs = model.generate(
         **inputs,
         forced_bos_token_id=target_lang_id,
         max_length=512
     )
     
-    # 4. Decode the output tokens back into readable text
     output_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
     return output_text.strip()
 
@@ -346,34 +301,133 @@ def generate_tts_audio(text: str, lang_code: str) -> str:
     tts.save(temp_out.name)
     return temp_out.name
 
-# --- Evaluation Metrics ---
+# --- Transcription (whole-clip AND sentence-level, one Whisper pass) ---
 
-# slow whisper model
-# def do_transcribe(filepath: str) -> str:
-#     import whisper
-#     audio = whisper.load_audio(filepath)
-#     audio = whisper.pad_or_trim(audio)
-#     mel = whisper.log_mel_spectrogram(audio, n_mels=whisper_model.dims.n_mels).to(whisper_model.device)
-#     options = whisper.DecodingOptions()
-#     return whisper.decode(whisper_model, mel, options).text
+def do_transcribe_segments(filepath: str):
+    """Transcribes audio ONCE with Faster-Whisper (VAD-filtered) and
+    returns the individual sentence-level segments as plain strings.
+    Both the whole-clip transcript (via join_segment_text) and the
+    chunk-level evaluation below are derived from this single pass, so
+    long audio is never transcribed twice."""
+    segments, info = whisper_model.transcribe(
+        filepath,
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+    )
+    return [seg.text.strip() for seg in segments if seg.text.strip()]
+
+
+def join_segment_text(segments) -> str:
+    return " ".join(segments).strip()
+
 
 def do_transcribe(filepath: str) -> str:
-    """Transcribes audio using optimized Faster-Whisper with VAD preprocessing."""
-    
-    # We no longer need to manually load, pad, or create mel spectrograms!
-    # faster-whisper handles optimal chunking under the hood.
-    
-    segments, info = whisper_model.transcribe(
-        filepath, 
-        beam_size=5,
-        vad_filter=True, # Preprocessing: Instantly strips out silence!
-        vad_parameters=dict(min_silence_duration_ms=500) # Aggressively cuts dead air
-    )
-    
-    # The transcription is a generator, so we iterate through it to get the text
-    full_text = " ".join([segment.text for segment in segments])
-    
-    return full_text.strip()
+    """Kept for compatibility with any external callers; internally just
+    transcribes segments and joins them."""
+    return join_segment_text(do_transcribe_segments(filepath))
+
+
+# --- Content-based, merge-aware chunk alignment ---
+
+def _encode_spans(texts, max_merge: int):
+    """Embed every single segment AND every merge of up to max_merge
+    consecutive segments. Returns {(start_index, length): embedding}."""
+    spans, span_texts = [], []
+    n = len(texts)
+    for length in range(1, max_merge + 1):
+        for start in range(0, n - length + 1):
+            spans.append((start, length))
+            span_texts.append(" ".join(texts[start:start + length]))
+    if not span_texts:
+        return {}
+    embeddings = align_model.encode(span_texts, normalize_embeddings=True)
+    return {span: emb for span, emb in zip(spans, embeddings)}
+
+
+def align_segments_by_content(src_segments, mt_segments, min_similarity: float = 0.5, max_merge: int = 2):
+    """Align source and translation segments by MEANING using LaBSE
+    embeddings plus a monotonic dynamic-programming alignment (same
+    family of technique as bitext-alignment tools like Gale-Church /
+    Vecalign). Allows 1-1, 1-2, 2-1 and 2-2 merges, since a sentence
+    spoken as one unit in the source is often split (or two combined)
+    on the translated side.
+
+    Segments that can't find an acceptable match even after trying
+    merges are returned separately as "unmatched" rather than
+    force-paired or silently dropped.
+
+    Returns (pairs, unmatched_src, unmatched_mt), where each pair is a
+    dict: {src, mt, src_count, mt_count, similarity}.
+    """
+    n, m = len(src_segments), len(mt_segments)
+    if n == 0 or m == 0:
+        return [], list(src_segments), list(mt_segments)
+
+    src_emb = _encode_spans(src_segments, max_merge)
+    mt_emb = _encode_spans(mt_segments, max_merge)
+
+    def sim(i, li, j, lj):
+        a, b = src_emb.get((i, li)), mt_emb.get((j, lj))
+        return None if a is None or b is None else float(np.dot(a, b))
+
+    NEG = float("-inf")
+    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
+    bp = [[None] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+
+    for i in range(n + 1):
+        for j in range(m + 1):
+            if i == 0 and j == 0:
+                continue
+            best, best_bp = NEG, None
+
+            if i > 0 and dp[i - 1][j] > best:
+                best, best_bp = dp[i - 1][j], (i - 1, j, 1, 0)
+            if j > 0 and dp[i][j - 1] > best:
+                best, best_bp = dp[i][j - 1], (i, j - 1, 0, 1)
+
+            for li in range(1, max_merge + 1):
+                if i - li < 0:
+                    continue
+                for lj in range(1, max_merge + 1):
+                    if j - lj < 0:
+                        continue
+                    s = sim(i - li, li, j - lj, lj)
+                    if s is None or s < min_similarity:
+                        continue
+                    cand = dp[i - li][j - lj] + s
+                    if cand > best:
+                        best, best_bp = cand, (i - li, j - lj, li, lj)
+
+            dp[i][j] = best
+            bp[i][j] = best_bp
+
+    pairs, matched_src, matched_mt = [], set(), set()
+    i, j = n, m
+    while i > 0 or j > 0:
+        step = bp[i][j]
+        if step is None:
+            break
+        pi, pj, li, lj = step
+        if li > 0 and lj > 0:
+            pairs.append({
+                "src": " ".join(src_segments[pi:pi + li]),
+                "mt": " ".join(mt_segments[pj:pj + lj]),
+                "src_count": li, "mt_count": lj,
+                "similarity": sim(pi, li, pj, lj),
+            })
+            matched_src.update(range(pi, pi + li))
+            matched_mt.update(range(pj, pj + lj))
+        i, j = pi, pj
+
+    pairs.reverse()
+    unmatched_src = [src_segments[k] for k in range(n) if k not in matched_src]
+    unmatched_mt = [mt_segments[k] for k in range(m) if k not in matched_mt]
+    return pairs, unmatched_src, unmatched_mt
+
+
+# --- Evaluation Metrics ---
 
 def do_cometeval(src_text: str, mt_text: str) -> float:
     data = [{"src": src_text, "mt": mt_text}]
@@ -409,29 +463,104 @@ def do_metricx_eval(src_text: str, mt_text: str) -> float:
         st.warning(f"MetricX failed: {e}")
         return None
 
-# Canonical 8-class label set returned by the wav2vec2 SER model.
-# Kept in this fixed order so cosine similarity is computed against the
-# same axis for every pair of source / target predictions.
-SER_LABELS = [
-    "angry", "calm", "disgust", "fearful",
-    "happy", "neutral", "sad", "surprised",
-]
+
+def do_cometeval_batch(pairs):
+    """COMET-Kiwi score for every aligned chunk pair in one batched call."""
+    if not pairs:
+        return []
+    data = [{"src": p["src"], "mt": p["mt"]} for p in pairs]
+    use_gpu = 1 if torch.cuda.is_available() else 0
+    model_output = comet_model.predict(data, batch_size=8, gpus=use_gpu)
+    return [round(float(s), 4) for s in model_output.scores]
+
+
+def do_metricx_eval_batch(pairs):
+    """MetricX-24 score for every aligned chunk pair in one batched
+    subprocess call (loads the model once, scores every chunk)."""
+    if not pairs:
+        return []
+    metricx_dir = "metricx" if os.path.exists("metricx") else "."
+    results_dir = os.path.join(metricx_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    input_path = os.path.abspath(os.path.join(results_dir, "metricx_chunk_input.jsonl"))
+    output_path = os.path.abspath(os.path.join(results_dir, "metricx_chunk_output.jsonl"))
+
+    with open(input_path, "w", encoding="utf-8") as f:
+        for p in pairs:
+            f.write(json.dumps({"source": p["src"], "hypothesis": p["mt"], "reference": ""}) + "\n")
+
+    command = [
+        sys.executable, "-m", "metricx24.predict",
+        "--tokenizer", "google/mt5-xl",
+        "--model_name_or_path", "google/metricx-24-hybrid-large-v2p6-bfloat16",
+        "--max_input_length", "1536",
+        "--batch_size", "1",
+        "--input_file", input_path,
+        "--output_file", output_path,
+        "--qe"
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, cwd=metricx_dir)
+        with open(output_path, "r", encoding="utf-8") as f:
+            return [round(float(json.loads(line).get("prediction", 0.0)), 4) for line in f]
+    except Exception as e:
+        st.warning(f"MetricX (chunk-level) failed: {e}")
+        return []
+
+
+def do_sentiment_batch(texts):
+    """5-class sentiment (Very Negative..Very Positive) for a list of
+    texts, in one batched call. Text-only - see load_sentiment_model()
+    docstring for the known tone/delivery limitation."""
+    if not texts:
+        return []
+    return sentiment_pipeline(texts)
+
+
+def build_metrics_comparison_chart(chunk_pairs, comet_scores, metricx_scores):
+    """Line chart of COMET-Kiwi and MetricX-24 across the sequence of
+    aligned chunks, both put on the SAME 0-1 scale (1 = good) so they can
+    be compared directly: MetricX (0-25, lower=better) is normalised as
+    1 - score/25. X-axis is chunk order, not audio timestamps."""
+    import plotly.graph_objects as go
+
+    x = list(range(1, len(chunk_pairs) + 1))
+    metricx_norm = [
+        round(1 - (s / 25.0), 4) if s is not None else None
+        for s in metricx_scores
+    ]
+    hover_texts = [
+        f"EN: {p['src'][:70]}<br>ES: {p['mt'][:70]}" for p in chunk_pairs
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=comet_scores, name="COMET-Kiwi",
+        mode="lines+markers",
+        hovertext=hover_texts, hoverinfo="text+y",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x[:len(metricx_norm)], y=metricx_norm, name="MetricX-24 (normalised: 1 - score/25)",
+        mode="lines+markers",
+        hovertext=hover_texts[:len(metricx_norm)], hoverinfo="text+y",
+    ))
+    fig.update_layout(
+        xaxis_title="Chunk # (sequence order in the audio)",
+        yaxis=dict(title="Quality score (0-1, higher = better)", range=[0, 1]),
+        legend=dict(orientation="h", y=1.15),
+        height=420,
+        margin=dict(t=60),
+        hovermode="x unified",
+    )
+    return fig
 
 
 def do_audio_emotion(audio_path: str):
     """Run Speech Emotion Recognition directly on an audio waveform.
-
-    Loads the file with ``librosa`` at 16 kHz mono (the sampling rate the
-    wav2vec2 backbone expects), passes the waveform through the cached
-    ``AutoFeatureExtractor`` + custom backbone-plus-head module from
-    ``load_audio_emotion_pipeline``, applies ``softmax`` over the logits,
-    and returns ``[{"label": str, "score": float}, ...]`` sorted
-    high-to-low.
-    """
+    NOTE: only meaningful while ENABLE_SER is True."""
     if not audio_path or not os.path.exists(audio_path):
         return []
     try:
-        # librosa.load returns float32 mono audio at the requested rate.
         waveform, _ = librosa.load(audio_path, sr=16000, mono=True)
         inputs = audio_emotion_proc(
             waveform, sampling_rate=16000, return_tensors="pt"
@@ -452,11 +581,7 @@ def do_audio_emotion(audio_path: str):
 
 
 def compute_affective_match_score(src_preds, mt_preds) -> float:
-    """Cosine similarity of two SER distributions over ``SER_LABELS``.
-
-    An exact top-1 match (with otherwise identical distributions) yields
-    ~1.0. Returns 0.0 if either side is missing or degenerate.
-    """
+    """Cosine similarity of two SER distributions over SER_LABELS."""
     if not src_preds or not mt_preds:
         return 0.0
     src_map = {p["label"]: float(p["score"]) for p in src_preds}
@@ -480,7 +605,10 @@ if "eval_history" not in st.session_state:
 # =========================================================
 
 st.title("🎙️ Speech-to-Speech Translation & Quality Evaluation")
-st.markdown("Compare direct vs cascaded translation architectures and evaluate translation quality together with affective / acoustic tone preservation (Speech Emotion Recognition over the audio waveforms).")
+if ENABLE_SER:
+    st.markdown("Compare direct vs cascaded translation architectures and evaluate translation quality together with affective / acoustic tone preservation (Speech Emotion Recognition over the audio waveforms).")
+else:
+    st.markdown("Compare direct vs cascaded translation architectures and evaluate translation quality (semantic accuracy) sentence-by-sentence, plus text-based sentiment. *Affective / acoustic tone evaluation (SER) is temporarily disabled pending a multilingual model fix.*")
 
 # Initialize the Tabs
 tab_main, tab_history = st.tabs(["🔍 Translation & Eval", "📜 Run History"])
@@ -551,7 +679,9 @@ with tab_main:
         else:
             with st.spinner("Processing..."):
                 
-                # --- Step 1: Handle Audio Generation ---
+                # --- Step 1: Handle Audio Generation, and transcribe ONCE
+                # (as sentence-level segments) for both whole-clip and
+                # chunk-level use downstream. ---
                 if mode == "Generate Translation":
                     if translation_system == "SeamlessM4T (Direct S2ST)":
                         with st.status("Translating audio with SeamlessM4T...", expanded=True) as status:
@@ -559,41 +689,71 @@ with tab_main:
                             status.update(label="Translation audio generated!", state="complete")
                             
                         with st.status("Transcribing source and target audio...", expanded=False):
-                            src_text = do_transcribe(src_audio_path)
-                            mt_text = do_transcribe(mt_audio_path)
+                            src_segments = do_transcribe_segments(src_audio_path)
+                            mt_segments = do_transcribe_segments(mt_audio_path)
                             
                     else: # Cascaded Architecture
                         with st.status("Running cascaded translation pipeline...", expanded=True) as status:
                             st.write("1. Transcribing source audio with Whisper...")
-                            src_text = do_transcribe(src_audio_path)
+                            src_segments = do_transcribe_segments(src_audio_path)
+                            src_text_for_mt = join_segment_text(src_segments)
                             
-                            st.write("2. Translating text with HY-MT1.5-1.8B...")
-                            # cascaded_mt_text = generate_hy_mt_translation(src_text, target_lang)
-                            cascaded_mt_text = generate_nllb_translation(src_text, target_lang)
+                            st.write("2. Translating text with NLLB-200...")
+                            cascaded_mt_text = generate_nllb_translation(src_text_for_mt, target_lang)
                             
                             st.write("3. Synthesizing translated text into audio (TTS)...")
                             mt_audio_path = generate_tts_audio(cascaded_mt_text, target_lang)
                             status.update(label="Cascaded translation generated!", state="complete")
 
                         with st.status("Transcribing synthesized audio for strict evaluation...", expanded=False):
-                            # We transcribe the TTS audio so the evaluation strictly scores the final audio output
-                            mt_text = do_transcribe(mt_audio_path)
+                            mt_segments = do_transcribe_segments(mt_audio_path)
 
                 else: # Manual Evaluation Mode
                     with st.status("Transcribing source and translated audio...", expanded=False):
-                        src_text = do_transcribe(src_audio_path)
-                        mt_text = do_transcribe(mt_audio_path)
+                        src_segments = do_transcribe_segments(src_audio_path)
+                        mt_segments = do_transcribe_segments(mt_audio_path)
 
-                # --- Step 2: Quality & Paralinguistic Evaluation ---
-                with st.status(
-                    "Calculating quality and affective (audio emotion) metrics...",
-                    expanded=False,
-                ):
-                    comet_score = do_cometeval(src_text, mt_text)
-                    metricx_score = do_metricx_eval(src_text, mt_text)
-                    src_emotion = do_audio_emotion(src_audio_path)
-                    mt_emotion  = do_audio_emotion(mt_audio_path)
-                    affective_match = compute_affective_match_score(src_emotion, mt_emotion)
+                src_text = join_segment_text(src_segments)
+                mt_text = join_segment_text(mt_segments)
+
+                # --- Step 2: Whole-clip quality (+ SER if enabled) ---
+                status_label = (
+                    "Calculating affective metrics..."
+                    if ENABLE_SER else
+                    "Preparing evaluation..."
+                )
+                with st.status(status_label, expanded=False):
+                    # Whole-clip COMET/MetricX are NOT computed separately
+                    # here - that would mean loading MetricX's 2.46GB model
+                    # from a fresh subprocess TWICE per run (once here, once
+                    # again for the chunk batch below). The chunk-level
+                    # average, computed once, is used as the headline number
+                    # instead - it's also a more honest summary of a
+                    # multi-sentence clip than one big-blob score anyway
+                    # (see project notes on why whole-clip scoring on long
+                    # audio produces out-of-domain, less meaningful numbers).
+                    if ENABLE_SER:
+                        src_emotion = do_audio_emotion(src_audio_path)
+                        mt_emotion  = do_audio_emotion(mt_audio_path)
+                        affective_match = compute_affective_match_score(src_emotion, mt_emotion)
+                    else:
+                        src_emotion, mt_emotion, affective_match = [], [], 0.0
+
+                # --- Step 3: Sentence-level alignment, scoring, sentiment ---
+                with st.status("Aligning sentence-level chunks by content...", expanded=False):
+                    chunk_pairs, unmatched_src, unmatched_mt = align_segments_by_content(
+                        src_segments, mt_segments
+                    )
+                    if chunk_pairs:
+                        chunk_comet_scores = do_cometeval_batch(chunk_pairs)
+                        chunk_metricx_scores = do_metricx_eval_batch(chunk_pairs)
+                        chunk_src_texts = [p["src"] for p in chunk_pairs]
+                        chunk_mt_texts = [p["mt"] for p in chunk_pairs]
+                        chunk_src_sentiment = do_sentiment_batch(chunk_src_texts)
+                        chunk_mt_sentiment = do_sentiment_batch(chunk_mt_texts)
+                    else:
+                        chunk_comet_scores, chunk_metricx_scores = [], []
+                        chunk_src_sentiment, chunk_mt_sentiment = [], []
 
             st.success("Workflow Complete!")
 
@@ -620,60 +780,109 @@ with tab_main:
 
             st.divider()
 
-            st.subheader("📊 Translation Quality Estimation")
-            m_col1, m_col2 = st.columns(2)
-            m_col1.metric("COMET-Kiwi Score", f"{comet_score}")
-            m_col2.metric("MetricX-24 QE Score", f"{metricx_score}" if metricx_score is not None else "N/A")
+            st.divider()
 
-            st.subheader("🎭 Affective & Acoustic Tone Alignment")
-            ae_col1, ae_col2, ae_col3 = st.columns(3)
-            top_src = src_emotion[0] if src_emotion else {"label": "n/a", "score": 0.0}
-            top_mt  = mt_emotion[0]  if mt_emotion  else {"label": "n/a", "score": 0.0}
-            with ae_col1:
-                st.markdown("**Source Audio Emotion**")
-                st.markdown(
-                    f"<div style='font-size:1.35em;font-weight:600'>{top_src['label']}</div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"<span style='background:#e6f4ff;color:#003a8c;padding:2px 8px;"
-                    f"border-radius:8px;font-size:0.85em'>confidence {top_src['score']:.1%}</span>",
-                    unsafe_allow_html=True,
-                )
-                if len(src_emotion) > 1:
-                    runner_ups = ", ".join(
-                        f"{p['label']} ({p['score']:.1%})"
-                        for p in src_emotion[1:4]
-                    )
-                    st.caption(f"Runner-ups: {runner_ups}")
-            with ae_col2:
-                st.markdown("**Target Audio Emotion**")
-                st.markdown(
-                    f"<div style='font-size:1.35em;font-weight:600'>{top_mt['label']}</div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"<span style='background:#fff4e6;color:#7a4a00;padding:2px 8px;"
-                    f"border-radius:8px;font-size:0.85em'>confidence {top_mt['score']:.1%}</span>",
-                    unsafe_allow_html=True,
-                )
-                if len(mt_emotion) > 1:
-                    runner_ups = ", ".join(
-                        f"{p['label']} ({p['score']:.1%})"
-                        for p in mt_emotion[1:4]
-                    )
-                    st.caption(f"Runner-ups: {runner_ups}")
-            with ae_col3:
-                st.markdown("**Affective / Acoustic Tone Match**")
-                st.metric("Match %", f"{affective_match:.1%}")
-                match_top1 = (
-                    top_src["label"] == top_mt["label"]
-                    and top_src["label"] != "n/a"
-                )
+            st.subheader("📊 Translation Quality")
+            if not chunk_pairs:
+                st.warning("No chunk pairs could be aligned for this clip (too short, or no acceptable semantic match found).")
+                comet_score, metricx_score = None, None
+            else:
+                c_comet_avg = sum(chunk_comet_scores) / len(chunk_comet_scores) if chunk_comet_scores else None
+                c_metricx_avg = sum(chunk_metricx_scores) / len(chunk_metricx_scores) if chunk_metricx_scores else None
+                # Used as the headline numbers (see note above on why we
+                # don't ALSO run a separate whole-clip MetricX pass).
+                comet_score = round(c_comet_avg, 4) if c_comet_avg is not None else None
+                metricx_score = round(c_metricx_avg, 4) if c_metricx_avg is not None else None
+
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Chunks aligned", f"{len(chunk_pairs)}")
+                cc2.metric("Avg COMET-Kiwi", f"{c_comet_avg:.3f}" if c_comet_avg is not None else "N/A")
+                cc3.metric("Avg MetricX-24", f"{c_metricx_avg:.3f}" if c_metricx_avg is not None else "N/A")
+
                 st.caption(
-                    "Top-1 label match: ✅"
-                    if match_top1 else "Top-1 label match: ❌"
+                    "📈 Sentence-Level Quality Over the Clip — COMET-Kiwi and MetricX-24 "
+                    "scored per aligned chunk, both shown on the same 0-1 scale (1 = good). "
+                    "MetricX (natively 0-25, lower = better) is normalised here as "
+                    "1 - score/25 so the two lines are directly comparable. Hover a point "
+                    "to see the sentence pair it corresponds to."
                 )
+                fig = build_metrics_comparison_chart(chunk_pairs, chunk_comet_scores, chunk_metricx_scores)
+                st.plotly_chart(fig, use_container_width=True)
+
+                if unmatched_src or unmatched_mt:
+                    with st.expander(
+                        f"⚠️ {len(unmatched_src) + len(unmatched_mt)} segment(s) had no acceptable match - review directly"
+                    ):
+                        st.caption(
+                            "These segments could not be aligned even after trying merges, "
+                            "and are NOT included in the chart or averages above - they are "
+                            "the most likely candidates for a genuine translation omission "
+                            "or a transcription error."
+                        )
+                        if unmatched_src:
+                            st.markdown("**Unmatched source segments:**")
+                            for s in unmatched_src:
+                                st.markdown(f"- {s}")
+                        if unmatched_mt:
+                            st.markdown("**Unmatched translation segments:**")
+                            for m in unmatched_mt:
+                                st.markdown(f"- {m}")
+
+                st.divider()
+
+                st.subheader("💬 Sentence-by-Sentence Sentiment (5-class)")
+                st.caption(
+                    "Very Negative / Negative / Neutral / Positive / Very Positive, per "
+                    "aligned chunk. This reads the TRANSCRIPT TEXT only, not vocal tone or "
+                    "delivery - two sentences that read identically but were SPOKEN with "
+                    "very different emotion will get the same label here. That is a known, "
+                    "confirmed limitation, not a bug - see project notes."
+                )
+                sent_rows = []
+                for idx, p in enumerate(chunk_pairs):
+                    s = chunk_src_sentiment[idx] if idx < len(chunk_src_sentiment) else {"label": "n/a", "score": 0.0}
+                    m = chunk_mt_sentiment[idx] if idx < len(chunk_mt_sentiment) else {"label": "n/a", "score": 0.0}
+                    sent_rows.append({
+                        "#": idx + 1,
+                        "Source": p["src"],
+                        "Src Sentiment": s["label"],
+                        "Src Conf": round(float(s["score"]), 2),
+                        "Translation": p["mt"],
+                        "Tgt Sentiment": m["label"],
+                        "Tgt Conf": round(float(m["score"]), 2),
+                        "Match": "✅" if s["label"] == m["label"] else "❌",
+                    })
+                st.dataframe(pd.DataFrame(sent_rows), use_container_width=True, hide_index=True)
+
+            if ENABLE_SER:
+                st.divider()
+                st.subheader("🎭 Affective & Acoustic Tone Alignment")
+                ae_col1, ae_col2, ae_col3 = st.columns(3)
+                top_src = src_emotion[0] if src_emotion else {"label": "n/a", "score": 0.0}
+                top_mt  = mt_emotion[0]  if mt_emotion  else {"label": "n/a", "score": 0.0}
+                with ae_col1:
+                    st.markdown("**Source Audio Emotion**")
+                    st.markdown(f"<div style='font-size:1.35em;font-weight:600'>{top_src['label']}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<span style='background:#e6f4ff;color:#003a8c;padding:2px 8px;border-radius:8px;font-size:0.85em'>confidence {top_src['score']:.1%}</span>", unsafe_allow_html=True)
+                    if len(src_emotion) > 1:
+                        runner_ups = ", ".join(f"{p['label']} ({p['score']:.1%})" for p in src_emotion[1:4])
+                        st.caption(f"Runner-ups: {runner_ups}")
+                with ae_col2:
+                    st.markdown("**Target Audio Emotion**")
+                    st.markdown(f"<div style='font-size:1.35em;font-weight:600'>{top_mt['label']}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<span style='background:#fff4e6;color:#7a4a00;padding:2px 8px;border-radius:8px;font-size:0.85em'>confidence {top_mt['score']:.1%}</span>", unsafe_allow_html=True)
+                    if len(mt_emotion) > 1:
+                        runner_ups = ", ".join(f"{p['label']} ({p['score']:.1%})" for p in mt_emotion[1:4])
+                        st.caption(f"Runner-ups: {runner_ups}")
+                with ae_col3:
+                    st.markdown("**Affective / Acoustic Tone Match**")
+                    st.metric("Match %", f"{affective_match:.1%}")
+                    match_top1 = top_src["label"] == top_mt["label"] and top_src["label"] != "n/a"
+                    st.caption("Top-1 label match: ✅" if match_top1 else "Top-1 label match: ❌")
+            else:
+                top_src = {"label": "n/a", "score": 0.0}
+                top_mt = {"label": "n/a", "score": 0.0}
+                st.caption("🎭 Affective / acoustic tone evaluation (SER) is temporarily disabled.")
 
             record = {
                 "Workflow": mode,
@@ -685,10 +894,22 @@ with tab_main:
                 "Translated Text": mt_text,
                 "COMET-Kiwi": comet_score,
                 "MetricX-24": metricx_score,
-                "Source Audio Emotion": top_src["label"],
-                "Target Audio Emotion": top_mt["label"],
-                "Affective Match Score": round(affective_match, 4),
+                "Chunks Aligned": len(chunk_pairs),
+                "Chunks Unmatched": len(unmatched_src) + len(unmatched_mt),
+                "Avg COMET-Kiwi (chunked)": round(sum(chunk_comet_scores) / len(chunk_comet_scores), 4) if chunk_comet_scores else None,
+                "Avg MetricX-24 (chunked)": round(sum(chunk_metricx_scores) / len(chunk_metricx_scores), 4) if chunk_metricx_scores else None,
             }
+            if chunk_pairs and chunk_src_sentiment and chunk_mt_sentiment:
+                agree = sum(
+                    1 for s, m in zip(chunk_src_sentiment, chunk_mt_sentiment) if s["label"] == m["label"]
+                ) / len(chunk_pairs)
+                record["Sentiment Agreement %"] = round(agree * 100, 1)
+            if ENABLE_SER:
+                record.update({
+                    "Source Audio Emotion": top_src["label"],
+                    "Target Audio Emotion": top_mt["label"],
+                    "Affective Match Score": round(affective_match, 4),
+                })
             st.session_state.eval_history.append(record)
 
 # ---------------------------------------------------------
@@ -700,13 +921,9 @@ with tab_history:
     if not st.session_state.eval_history:
         st.info("No evaluations have been run yet. Process an audio file to see your results accumulate here.")
     else:
-        # Convert session state list to DataFrame
         history_df = pd.DataFrame(st.session_state.eval_history)
-        
-        # Display the interactive dataframe
         st.dataframe(history_df, use_container_width=True)
         
-        # Export and Clear Buttons
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
             csv_data = history_df.to_csv(index=False).encode('utf-8')
