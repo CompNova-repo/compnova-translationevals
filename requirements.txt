@@ -10,3 +10,5 @@ scipy
 librosa
 soundfile
 gTTS
+sentence-transformers
+plotly
