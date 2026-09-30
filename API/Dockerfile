@@ -1,16 +1,4 @@
-# CompNova Translation Evaluation API
-#
-# Encodes the exact package-pinning sequence discovered over a full day of
-# debugging in Colab. unbabel-comet needs OLDER numpy / protobuf /
-# huggingface_hub / tokenizers / transformers / torchmetrics than most
-# other packages here expect by default - every install after that pin
-# uses --no-deps so pip can't silently undo it again.
-#
-# NOT YET BUILD-TESTED END TO END: Colab cannot run a Docker daemon, so
-# this was written to match the proven Colab install order but has not
-# had a real `docker build` run against it. Build and test locally
-# before treating this as production-ready - there's a real chance one
-# more surprise is waiting, the same as almost every step today.
+
 
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
