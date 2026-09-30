@@ -1,17 +1,3 @@
-# CompNova Translation Evaluation API - CPU-only variant
-#
-# For local testing on machines without an NVIDIA GPU (e.g. Mac, or Docker
-# Desktop on Mac, which can't pass through GPU hardware to a container
-# regardless of the host's GPU). Same install sequence as the GPU
-# Dockerfile, minus the CUDA base image and GPU torch wheel.
-#
-# Expect this to be noticeably slower per request than the GPU version -
-# fine for confirming the container builds and the API logic works, not
-# meant for real serving.
-#
-# NOT YET BUILD-TESTED END TO END. Build and run this yourself; treat any
-# error the same way we debugged Colab all day - it's very likely another
-# small pin/package fix, not a sign anything is fundamentally broken.
 
 FROM python:3.10-slim
 
