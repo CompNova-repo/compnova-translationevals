@@ -3,3 +3,5 @@
 data/
 __pycache__/
 *.pyc
+.*/
+codebase_eval_pulkit/

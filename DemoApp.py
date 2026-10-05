@@ -15,6 +15,9 @@ import librosa
 import torch
 from gtts import gTTS
 import faster_whisper
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Canonical 8-class label set returned by the wav2vec2 SER model. Defined
 # here, near the top, because load_audio_emotion_pipeline() references it
@@ -43,7 +46,7 @@ st.set_page_config(
     layout="wide"
 )
 
-HF_TOKEN = "REDACTED_HF_TOKEN"
+HF_TOKEN = os.getenv("HF_TOKEN", None)
 if not HF_TOKEN and hasattr(st, "secrets") and "HF_TOKEN" in st.secrets:
     HF_TOKEN = st.secrets["HF_TOKEN"]
 
