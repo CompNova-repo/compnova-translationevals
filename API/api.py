@@ -48,6 +48,28 @@ def _save_upload(upload: UploadFile) -> str:
         return tmp.name
 
 
+@app.post("/transcribe")
+async def transcribe(
+    audio: UploadFile = File(..., description="Audio to transcribe (WAV/MP3)"),
+):
+    """
+    Transcribe a single audio file (Faster-Whisper). Used by thin
+    front ends (e.g. the Streamlit demo's cascaded-translation path)
+    that need source text to translate, WITHOUT loading Whisper
+    themselves - keeps every model loaded in exactly one place.
+    """
+    path = None
+    try:
+        path = _save_upload(audio)
+        segments = eval_core.transcribe_segments(path)
+        return {"transcript": eval_core.join_segment_text(segments)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 @app.post("/evaluate")
 async def evaluate(
     source_audio: UploadFile = File(..., description="Source-language audio (WAV/MP3)"),
