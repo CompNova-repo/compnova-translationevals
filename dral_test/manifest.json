@@ -1,0 +1,178 @@
+{
+  "sample_rate": 16000,
+  "target_seconds": 120.0,
+  "silence_seconds": 0.35,
+  "pairs_used": 24,
+  "english_duration_seconds": 125.626,
+  "spanish_duration_seconds": 123.887,
+  "pairs": [
+    {
+      "pair_id": "001_1",
+      "english_file": "EN_001_#1.wav",
+      "spanish_file": "ES_001_#1.wav",
+      "english_duration": 1.838,
+      "spanish_duration": 1.28
+    },
+    {
+      "pair_id": "001_2",
+      "english_file": "EN_001_#2.wav",
+      "spanish_file": "ES_001_#2.wav",
+      "english_duration": 9.162,
+      "spanish_duration": 6.0
+    },
+    {
+      "pair_id": "001_3",
+      "english_file": "EN_001_#3.wav",
+      "spanish_file": "ES_001_#3.wav",
+      "english_duration": 4.134,
+      "spanish_duration": 4.505
+    },
+    {
+      "pair_id": "001_4",
+      "english_file": "EN_001_#4.wav",
+      "spanish_file": "ES_001_#4.wav",
+      "english_duration": 8.148,
+      "spanish_duration": 8.188
+    },
+    {
+      "pair_id": "001_5",
+      "english_file": "EN_001_#5.wav",
+      "spanish_file": "ES_001_#5.wav",
+      "english_duration": 6.635,
+      "spanish_duration": 8.434
+    },
+    {
+      "pair_id": "001_6",
+      "english_file": "EN_001_#6.wav",
+      "spanish_file": "ES_001_#6.wav",
+      "english_duration": 4.216,
+      "spanish_duration": 4.188
+    },
+    {
+      "pair_id": "001_7",
+      "english_file": "EN_001_#7.wav",
+      "spanish_file": "ES_001_#7.wav",
+      "english_duration": 5.081,
+      "spanish_duration": 4.491
+    },
+    {
+      "pair_id": "001_8",
+      "english_file": "EN_001_#8.wav",
+      "spanish_file": "ES_001_#8.wav",
+      "english_duration": 2.27,
+      "spanish_duration": 2.057
+    },
+    {
+      "pair_id": "001_9",
+      "english_file": "EN_001_#9.wav",
+      "spanish_file": "ES_001_#9.wav",
+      "english_duration": 10.061,
+      "spanish_duration": 6.95
+    },
+    {
+      "pair_id": "001_10",
+      "english_file": "EN_001_#10.wav",
+      "spanish_file": "ES_001_#10.wav",
+      "english_duration": 6.595,
+      "spanish_duration": 6.641
+    },
+    {
+      "pair_id": "001_11",
+      "english_file": "EN_001_#11.wav",
+      "spanish_file": "ES_001_#11.wav",
+      "english_duration": 3.121,
+      "spanish_duration": 3.604
+    },
+    {
+      "pair_id": "001_12",
+      "english_file": "EN_001_#12.wav",
+      "spanish_file": "ES_001_#12.wav",
+      "english_duration": 7.108,
+      "spanish_duration": 6.83
+    },
+    {
+      "pair_id": "001_13",
+      "english_file": "EN_001_#13.wav",
+      "spanish_file": "ES_001_#13.wav",
+      "english_duration": 8.487,
+      "spanish_duration": 7.226
+    },
+    {
+      "pair_id": "001_14",
+      "english_file": "EN_001_#14.wav",
+      "spanish_file": "ES_001_#14.wav",
+      "english_duration": 11.392,
+      "spanish_duration": 11.13
+    },
+    {
+      "pair_id": "001_15",
+      "english_file": "EN_001_#15.wav",
+      "spanish_file": "ES_001_#15.wav",
+      "english_duration": 3.257,
+      "spanish_duration": 4.216
+    },
+    {
+      "pair_id": "001_16",
+      "english_file": "EN_001_#16.wav",
+      "spanish_file": "ES_001_#16.wav",
+      "english_duration": 7.351,
+      "spanish_duration": 7.807
+    },
+    {
+      "pair_id": "002_1",
+      "english_file": "EN_002_#1.wav",
+      "spanish_file": "ES_002_#1.wav",
+      "english_duration": 1.87,
+      "spanish_duration": 1.67
+    },
+    {
+      "pair_id": "002_2",
+      "english_file": "EN_002_#2.wav",
+      "spanish_file": "ES_002_#2.wav",
+      "english_duration": 1.1,
+      "spanish_duration": 1.08
+    },
+    {
+      "pair_id": "002_3",
+      "english_file": "EN_002_#3.wav",
+      "spanish_file": "ES_002_#3.wav",
+      "english_duration": 2.23,
+      "spanish_duration": 2.46
+    },
+    {
+      "pair_id": "002_10",
+      "english_file": "EN_002_#10.wav",
+      "spanish_file": "ES_002_#10.wav",
+      "english_duration": 2.38,
+      "spanish_duration": 2.1
+    },
+    {
+      "pair_id": "002_11",
+      "english_file": "EN_002_#11.wav",
+      "spanish_file": "ES_002_#11.wav",
+      "english_duration": 2.6,
+      "spanish_duration": 3.89
+    },
+    {
+      "pair_id": "002_12",
+      "english_file": "EN_002_#12.wav",
+      "spanish_file": "ES_002_#12.wav",
+      "english_duration": 2.31,
+      "spanish_duration": 3.02
+    },
+    {
+      "pair_id": "002_13",
+      "english_file": "EN_002_#13.wav",
+      "spanish_file": "ES_002_#13.wav",
+      "english_duration": 1.05,
+      "spanish_duration": 1.17
+    },
+    {
+      "pair_id": "002_14",
+      "english_file": "EN_002_#14.wav",
+      "spanish_file": "ES_002_#14.wav",
+      "english_duration": 5.18,
+      "spanish_duration": 6.9
+    }
+  ]
+}
