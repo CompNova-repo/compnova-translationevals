@@ -43,7 +43,7 @@ st.set_page_config(
     layout="wide"
 )
 
-HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_TOKEN = "REDACTED_HF_TOKEN"
 if not HF_TOKEN and hasattr(st, "secrets") and "HF_TOKEN" in st.secrets:
     HF_TOKEN = st.secrets["HF_TOKEN"]
 
@@ -223,17 +223,38 @@ def load_audio_emotion_pipeline():
     id2label = {i: lbl for i, lbl in enumerate(SER_LABELS)}
     return feature_extractor, model, id2label
 
-# Initialize default models into cache
-processor, m4tmodel, translation_device = load_seamless_model()
-whisper_model = load_whisper()
-comet_model = load_comet()
-align_model = load_alignment_model()
-sentiment_pipeline = load_sentiment_model()
-if ENABLE_SER:
-    audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = load_audio_emotion_pipeline()
-else:
-    audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = None, None, None
-nllb_tokenizer, nllb_model = load_nllb_model()
+# Initialize models lazily - each one is wrapped in @st.cache_resource so it's
+# loaded on first use and cached for the session. Avoids OOM on machines that
+# can't hold all 6 models (~13 GB) in RAM simultaneously.
+@st.cache_resource(show_spinner=None)
+def get_seamless():
+    return load_seamless_model()
+
+@st.cache_resource(show_spinner=None)
+def get_whisper():
+    return load_whisper()
+
+@st.cache_resource(show_spinner=None)
+def get_comet():
+    return load_comet()
+
+@st.cache_resource(show_spinner=None)
+def get_align():
+    return load_alignment_model()
+
+@st.cache_resource(show_spinner=None)
+def get_sentiment():
+    return load_sentiment_model()
+
+@st.cache_resource(show_spinner=None)
+def get_nllb():
+    return load_nllb_model()
+
+@st.cache_resource(show_spinner=None)
+def get_audio_emotion():
+    if not ENABLE_SER:
+        return None, None, None
+    return load_audio_emotion_pipeline()
 
 # =========================================================
 # 2. CORE PROCESSING FUNCTIONS
@@ -249,9 +270,10 @@ def save_temp_file(uploaded_file) -> str:
 
 def generate_seamless_audio(source_filepath: str, target_lang_code: str) -> str:
     """End-to-End S2ST translation via SeamlessM4T."""
+    processor, m4tmodel, translation_device = get_seamless()
     audio_array, _ = librosa.load(source_filepath, sr=16000)
     audio_inputs = processor(audio=audio_array, sampling_rate=16000, return_tensors="pt").to(translation_device)
-    
+
     with torch.no_grad():
         output_tokens = m4tmodel.generate(
             **audio_inputs,
@@ -259,15 +281,15 @@ def generate_seamless_audio(source_filepath: str, target_lang_code: str) -> str:
             generate_speech=True
         )
     output_audio_array = output_tokens[0].cpu().numpy().squeeze()
-    
+
     temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     sf.write(temp_out.name, output_audio_array, m4tmodel.config.sampling_rate)
     return temp_out.name
 
 def generate_nllb_translation(source_text: str, target_lang: str) -> str:
     """Text-to-Text translation via Meta NLLB-200."""
-    tokenizer, model = nllb_tokenizer, nllb_model
-    
+    tokenizer, model = get_nllb()
+
     nllb_lang_map = {
         "spa": "spa_Latn",
         "fra": "fra_Latn",
@@ -309,6 +331,7 @@ def do_transcribe_segments(filepath: str):
     Both the whole-clip transcript (via join_segment_text) and the
     chunk-level evaluation below are derived from this single pass, so
     long audio is never transcribed twice."""
+    whisper_model = get_whisper()
     segments, info = whisper_model.transcribe(
         filepath,
         beam_size=5,
@@ -341,6 +364,7 @@ def _encode_spans(texts, max_merge: int):
             span_texts.append(" ".join(texts[start:start + length]))
     if not span_texts:
         return {}
+    align_model = get_align()
     embeddings = align_model.encode(span_texts, normalize_embeddings=True)
     return {span: emb for span, emb in zip(spans, embeddings)}
 
@@ -432,6 +456,7 @@ def align_segments_by_content(src_segments, mt_segments, min_similarity: float =
 def do_cometeval(src_text: str, mt_text: str) -> float:
     data = [{"src": src_text, "mt": mt_text}]
     use_gpu = 1 if torch.cuda.is_available() else 0
+    comet_model = get_comet()
     model_output = comet_model.predict(data, batch_size=1, gpus=use_gpu)
     return round(float(model_output.scores[0]), 4)
 
@@ -470,6 +495,7 @@ def do_cometeval_batch(pairs):
         return []
     data = [{"src": p["src"], "mt": p["mt"]} for p in pairs]
     use_gpu = 1 if torch.cuda.is_available() else 0
+    comet_model = get_comet()
     model_output = comet_model.predict(data, batch_size=8, gpus=use_gpu)
     return [round(float(s), 4) for s in model_output.scores]
 
@@ -514,6 +540,7 @@ def do_sentiment_batch(texts):
     docstring for the known tone/delivery limitation."""
     if not texts:
         return []
+    sentiment_pipeline = get_sentiment()
     return sentiment_pipeline(texts)
 
 
@@ -559,6 +586,9 @@ def do_audio_emotion(audio_path: str):
     """Run Speech Emotion Recognition directly on an audio waveform.
     NOTE: only meaningful while ENABLE_SER is True."""
     if not audio_path or not os.path.exists(audio_path):
+        return []
+    audio_emotion_proc, audio_emotion_model, audio_emotion_id2label = get_audio_emotion()
+    if audio_emotion_proc is None:
         return []
     try:
         waveform, _ = librosa.load(audio_path, sr=16000, mono=True)
@@ -618,20 +648,24 @@ with st.sidebar:
     
     mode = st.radio("Workflow Mode", ["Generate Translation", "Evaluate Existing Audio Pair"])
     
-    PRESETS = {
-        "Sample 1 (EN_138_#22.wav)": 
-            {"src": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\EN_138_#22.wav", 
-                "mt": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\ES_138_#22.wav"
-            },
-        "Sample 2 (EN_138_#10.wav)": 
-                    {"src": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\EN_138_#10.wav", 
-                        "mt": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\ES_138_#10.wav"
-                    },
-        "Sample 3 (EN_138_#8.wav)": 
-                    {"src": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\EN_138_#8.wav", 
-                        "mt": r"C:\Users\erich\Documents\Compnova\topi-full-data\DRAL testset data\fragments-long\fragments-long-MM\ES_138_#8.wav"
-                    },
-    }
+    # Preset audio samples for the "Source Audio Input → Preset" option.
+    # Uses portable, repo-relative paths into data/dral/ (created via
+    # `python download_dral_subset.py`). Only presets whose files actually
+    # exist on disk are shown, so this works on any machine — the previous
+    # version hard-coded absolute Windows paths specific to one laptop.
+    _PRESET_CANDIDATES = [
+        ("Sample 1 (EN_001_#1.wav)", "EN_001_#1.wav"),
+        ("Sample 2 (EN_001_#2.wav)", "EN_001_#2.wav"),
+        ("Sample 3 (EN_001_#3.wav)", "EN_001_#3.wav"),
+    ]
+
+    PRESETS = {}
+    for label, stem in _PRESET_CANDIDATES:
+        src = os.path.join("data", "dral", stem)
+        mt_lang = "ES" if stem.startswith("EN_") else "EN"
+        mt = os.path.join("data", "dral", stem.replace(stem[:2], mt_lang, 1))
+        if os.path.exists(src) and os.path.exists(mt):
+            PRESETS[label] = {"src": src, "mt": mt}
     
     src_audio_path = None
     mt_audio_path = None
@@ -650,8 +684,15 @@ with st.sidebar:
             if uploaded_src:
                 src_audio_path = save_temp_file(uploaded_src)
         else:
-            preset_name = st.selectbox("Select Preset", list(PRESETS.keys()))
-            src_audio_path = PRESETS[preset_name]["src"]
+            if not PRESETS:
+                st.warning(
+                    "No preset audio samples found in data/dral/. "
+                    "Run `python download_dral_subset.py` to fetch some, "
+                    "or switch to Upload File."
+                )
+            else:
+                preset_name = st.selectbox("Select Preset", list(PRESETS.keys()))
+                src_audio_path = PRESETS[preset_name]["src"]
 
         target_lang = st.selectbox(
             "Target Language",
