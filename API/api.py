@@ -101,10 +101,35 @@ async def evaluate(
         result = eval_core.evaluate_pair(
             src_path, mt_path, min_similarity=min_similarity, max_merge=max_merge
         )
-        return JSONResponse(content=result)
+        eval_id, created_at = save_evaluation(
+            result, source_audio.filename, target_audio.filename
+        )
+        return JSONResponse(content={"id": eval_id, "created_at": created_at, **result})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         for p in (src_path, mt_path):
             if p and os.path.exists(p):
                 os.remove(p)
+
+
+from eval_store import init_db, save_evaluation, list_evaluations, get_evaluation, get_latest
+init_db()
+
+@app.get("/evaluations")
+def evaluations(limit: int = 20):
+    return list_evaluations(limit)
+
+@app.get("/evaluations/latest")
+def latest_evaluation():
+    record = get_latest()
+    if record is None:
+        raise HTTPException(404, "No evaluations yet")
+    return record
+
+@app.get("/evaluations/{eval_id}")
+def evaluation(eval_id: str):
+    record = get_evaluation(eval_id)
+    if record is None:
+        raise HTTPException(404, "Evaluation not found")
+    return record
