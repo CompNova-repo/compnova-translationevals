@@ -83,7 +83,7 @@ The shared `/workspace` volume served model files as **empty** to a newly create
 
 ## Troubleshooting
 
-Logs are in `/workspace/logs/api.log` and `/workspace/logs/ui.log`.
+Logs are in `/root/logs/api.log` and `/root/logs/ui.log` (the pod's own disk; the shared volume shows new log lines late).
 
 If an evaluation fails with a 500 error mentioning `metricx24.predict`, run MetricX by hand to see its real error:
 

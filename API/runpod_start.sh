@@ -16,7 +16,7 @@
 #                       then asks for one.
 #   S2ST_MODEL_CACHE    Where models are downloaded (default /root/hf-cache, on the pod's
 #                       own disk; the shared /workspace volume proved unreliable for this).
-#   S2ST_LOG_DIR        Where logs go (default /workspace/logs).
+#   S2ST_LOG_DIR        Where logs go (default /root/logs).
 #   EVAL_DB_PATH        Where results are stored (default API/evaluations.db).
 set -euo pipefail
 
@@ -40,13 +40,8 @@ METRICX_COMMIT=fc4978eb064670f7cc33e93ea4f52d38396b8ae6
 API_PORT=8000
 UI_PORT=8501
 
-if [ -n "${S2ST_LOG_DIR:-}" ]; then
-  LOG_DIR="$S2ST_LOG_DIR"
-elif mkdir -p /workspace/logs 2>/dev/null && [ -w /workspace/logs ]; then
-  LOG_DIR=/workspace/logs
-else
-  LOG_DIR=/root/logs
-fi
+# Logs go on the pod's own disk: the shared /workspace volume shows new writes late.
+LOG_DIR="${S2ST_LOG_DIR:-/root/logs}"
 mkdir -p "$LOG_DIR"
 API_LOG="$LOG_DIR/api.log"
 UI_LOG="$LOG_DIR/ui.log"
@@ -282,6 +277,9 @@ MODELS = [
     ("tabularisai/multilingual-sentiment-analysis", None),
 ]
 
+# Weight formats this project never loads.
+SKIP = ["*.h5", "*.msgpack", "*.onnx", "onnx/*", "*.ot", "rust_model*", "openvino/*", "*.tflite"]
+
 def empty_files(path):
     return [os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs
             if os.path.getsize(os.path.join(r, f)) == 0]
@@ -291,7 +289,8 @@ for repo, patterns in MODELS:
     ok = False
     for attempt in (1, 2):
         try:
-            path = snapshot_download(repo, allow_patterns=patterns, force_download=(attempt == 2))
+            path = snapshot_download(repo, allow_patterns=patterns, ignore_patterns=SKIP,
+                                     force_download=(attempt == 2))
         except Exception as e:
             msg = str(e).splitlines()[0][:200]
             if "gated" in type(e).__name__.lower() or "401" in msg or "403" in msg:
@@ -327,9 +326,10 @@ else
   sleep 2
   setsid nohup "$PY" -m uvicorn api:app --host 0.0.0.0 --port "$API_PORT" > "$API_LOG" 2>&1 < /dev/null &
   echo -n "   loading models"
+  sleep 5
   for _ in $(seq 1 180); do
     if api_up; then break; fi
-    if ! pgrep -f "[u]vicorn api:app" >/dev/null; then
+    if ! pgrep -f "[u]vicorn api:app" >/dev/null && { sleep 3; ! pgrep -f "[u]vicorn api:app" >/dev/null; }; then
       echo; echo "   The API process exited. Last lines of $API_LOG:"; tail -30 "$API_LOG"
       fail "API did not start."
     fi
@@ -350,9 +350,10 @@ else
   setsid nohup "$PY" -m streamlit run DemoApp.py --server.port "$UI_PORT" --server.address 0.0.0.0 \
     --server.headless true --server.enableCORS false --server.enableXsrfProtection false \
     --server.enableWebsocketCompression false > "$UI_LOG" 2>&1 < /dev/null &
+  sleep 3
   for _ in $(seq 1 30); do
     if ui_up; then break; fi
-    if ! pgrep -f "[s]treamlit run" >/dev/null; then break; fi
+    if ! pgrep -f "[s]treamlit run" >/dev/null && { sleep 3; ! pgrep -f "[s]treamlit run" >/dev/null; }; then break; fi
     sleep 2
   done
   ui_up || { echo "   Last lines of $UI_LOG:"; tail -20 "$UI_LOG"; fail "dashboard did not start."; }
