@@ -324,7 +324,7 @@ if api_up; then
 else
   pkill -f "[u]vicorn api:app" || true
   sleep 2
-  setsid nohup "$PY" -m uvicorn api:app --host 0.0.0.0 --port "$API_PORT" > "$API_LOG" 2>&1 < /dev/null &
+  setsid nohup "$PY" -m uvicorn api:app --host 0.0.0.0 --port "$API_PORT" > "$API_LOG" 2>&1 < /dev/null 9>&- &
   echo -n "   loading models"
   sleep 5
   for _ in $(seq 1 180); do
@@ -349,7 +349,7 @@ else
   pkill -f "[s]treamlit run" || true
   setsid nohup "$PY" -m streamlit run DemoApp.py --server.port "$UI_PORT" --server.address 0.0.0.0 \
     --server.headless true --server.enableCORS false --server.enableXsrfProtection false \
-    --server.enableWebsocketCompression false > "$UI_LOG" 2>&1 < /dev/null &
+    --server.enableWebsocketCompression false > "$UI_LOG" 2>&1 < /dev/null 9>&- &
   sleep 3
   for _ in $(seq 1 30); do
     if ui_up; then break; fi
