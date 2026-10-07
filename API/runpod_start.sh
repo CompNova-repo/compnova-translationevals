@@ -65,6 +65,8 @@ flock -n 9 || fail "runpod_start.sh is already running in another terminal."
 unset GIT_CONFIG_PARAMETERS || true
 export HF_HOME="$MODEL_CACHE"
 export USE_TF=0 USE_TORCH=1
+# RunPod images set HF_HUB_ENABLE_HF_TRANSFER=1 without installing hf_transfer, which makes every download fail.
+export HF_HUB_ENABLE_HF_TRANSFER=0
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore PIP_BREAK_SYSTEM_PACKAGES=1
 export PIP_CACHE_DIR=/root/.cache/pip
 # Pulkit's patch makes Python ignore chmod errors on /workspace. Use it if it's there.
@@ -117,6 +119,7 @@ BASHRC_BLOCK="# S2ST env (added by runpod_start.sh)
 unset GIT_CONFIG_PARAMETERS
 export HF_HOME=$MODEL_CACHE
 export USE_TF=0 USE_TORCH=1
+export HF_HUB_ENABLE_HF_TRANSFER=0
 [ -f /workspace/python_patches/sitecustomize.py ] && export PYTHONPATH=/workspace/python_patches
 # end S2ST env"
 touch ~/.bashrc
