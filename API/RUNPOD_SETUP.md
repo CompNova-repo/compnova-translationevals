@@ -1,103 +1,103 @@
 # Running the S2ST evaluation service on RunPod
 
-This is how the evaluation API and dashboard run on the team's RunPod pod (one NVIDIA A40, 48 GB). It records what the pod needs and why, so the setup never has to be worked out again.
+How to bring the evaluation API and dashboard up on a RunPod GPU pod. One script does everything, on a brand-new pod or an existing one, for anyone on the team.
 
 ## Quick start
 
-On the pod, open a terminal (Connect, then Web Terminal) and run:
+1. In RunPod, make sure the pod exposes HTTP ports **8000** and **8501** (set this when creating the pod; changing it later restarts the pod).
+2. Open a terminal on the pod (Connect, then Web Terminal).
+3. If the repo isn't in `/workspace` yet, clone it (use a GitHub token as the password):
+   ```bash
+   cd /workspace
+   unset GIT_CONFIG_PARAMETERS
+   git clone -b SahilPatil266-API https://github.com/CompNova-repo/compnova-translationevals.git
+   ```
+4. Run:
+   ```bash
+   bash /workspace/compnova-translationevals/API/runpod_start.sh
+   ```
 
-```bash
-bash /workspace/compnova-translationevals/API/runpod_start.sh
-```
+On a new pod this takes about 10 minutes the first time: it installs the Python packages, downloads about 10 GB of models, then starts both services. On a pod that's already set up it takes seconds. It asks for a Hugging Face token once per pod if it can't find a saved one (input is hidden). The token's account must have accepted the terms of `Unbabel/wmt22-cometkiwi-da` on huggingface.co.
 
-That's all. The script checks every part of the setup, fixes whatever is missing, starts the API and the dashboard if they aren't already running, and prints both URLs. It is safe to run at any time, including on a pod that is already working, where it just confirms everything is up.
-
-Run it with `bash` rather than `./runpod_start.sh`. The `/workspace` volume does not allow changing file permissions, so the script can't be marked executable.
-
-Once it finishes:
+When it finishes it prints the two URLs:
 
 | What | URL |
 |---|---|
 | Dashboard | `https://<pod-id>-8501.proxy.runpod.net` |
 | API docs (run evaluations here) | `https://<pod-id>-8000.proxy.runpod.net/docs` |
 
-The current pod ID is `uzmdo0dc1kreia`. The script prints the URLs with the right ID filled in.
+Always run it with `bash`. The `/workspace` volume doesn't allow making files executable.
 
-## What survives a pod restart
-
-Only `/workspace` is persistent. It holds the repo, the Hugging Face model cache (`/workspace/models/huggingface`), Pulkit's Python patch (`/workspace/python_patches`), the logs and `evaluations.db`.
-
-Everything else is wiped when the pod restarts: installed Python packages and their versions, the faster-whisper patch, the MetricX clone in `/opt/metricx`, `~/.bashrc`, and any running processes. The start script rebuilds all of these, which is why it exists.
-
-**Do not change the pod's exposed ports or other settings unless necessary.** Editing the pod restarts it. Nothing is lost permanently, but the services stay down until someone runs the script again.
-
-## Why each step is needed
-
-**Environment variables.** `HF_HOME` points at the shared model cache so nothing is downloaded again. `PYTHONPATH` loads Pulkit's `sitecustomize.py`, which stops Python from failing on `/workspace`'s permission restrictions. The pod's own `PYTHONPATH` setting is broken: it contains the literal text `${PYTHONPATH:+:$PYTHONPATH}`, which RunPod doesn't expand, so the script overrides it. Fixing that value in the pod settings to plain `/workspace/python_patches` would be cleaner, but it restarts the pod. `USE_TF=0` and `USE_TORCH=1` stop `transformers` from importing TensorFlow if it ever reappears. The script also adds these lines to `~/.bashrc`, so new terminals pick them up.
-
-**`GIT_CONFIG_PARAMETERS`.** The pod sets this variable in a format git can't parse, which makes every git command fail with "bogus format in GIT_CONFIG_PARAMETERS". Unsetting it fixes git for that terminal.
-
-**Package pins.** COMET-Kiwi (`unbabel-comet==2.2.7`) needs older libraries than most installs pull in by default. The pinned versions are numpy 1.26.4, transformers 4.39.3, tokenizers 0.15.2, protobuf 4.25.9, accelerate 0.27.2, huggingface_hub 0.36.2 and torchmetrics 0.10.3. Installing almost anything else tends to upgrade some of these silently, so the script re-applies any that drifted. It also writes `/workspace/constraints.txt`. Install new packages with `pip install <package> -c /workspace/constraints.txt`, which lets pip add dependencies but forbids it from changing the pins.
-
-**Packages removed.** jax, TensorFlow, wandb, peft and their relatives crash on import with these pins (TensorFlow ships protobuf 5 files, jax needs numpy 2). `transformers` imports them automatically if they're installed, which breaks COMET and sentence-transformers. None of them are needed.
-
-**`datasets`.** MetricX's `predict.py` imports it. It isn't in the Dockerfile either, so the Docker build will need it too.
-
-**faster-whisper patch.** PyAV 14 and later removed the `metadata_errors` argument that faster-whisper 1.2.1 still passes when opening audio. Without the patch, every evaluation fails instantly with "open() got an unexpected keyword argument 'metadata_errors'".
-
-**MetricX location.** MetricX is Google research code, not a pip package. `eval_core.py` expects it in an `API/metricx` folder and will try to clone it there itself. That clone fails on `/workspace`, because git needs to change file permissions. So the script clones it into `/opt/metricx` on the container disk, at the pinned commit `fc4978e`, and `API/metricx` is a link to it. After a restart, `/opt` is empty and the script clones it again (a few seconds).
-
-**Starting the services.** Both are started with `setsid nohup ... &`, which detaches them from the terminal, so closing the browser tab doesn't stop them. Streamlit needs `--server.address 0.0.0.0` and the three proxy flags (`enableCORS`, `enableXsrfProtection`, `enableWebsocketCompression` all off), otherwise the page loads through RunPod's proxy but hangs because its websocket is rejected.
-
-## Running an evaluation
-
-Open the API docs URL, expand `POST /evaluate`, click Try it out, choose the source and translated audio files, and click Execute. The response includes an `id`, and the result appears on the dashboard after a refresh. From a script:
+## Other commands
 
 ```bash
-curl -F "source_audio=@EN.wav" -F "target_audio=@ES.wav" https://<pod-id>-8000.proxy.runpod.net/evaluate
+bash runpod_start.sh --check     # is everything running? changes nothing
+bash runpod_start.sh --restart   # restart API and dashboard, e.g. after pulling new code
 ```
+
+To update the code on the pod (plain `git pull` fails there, see below):
+
+```bash
+cd /workspace/compnova-translationevals/API
+unset GIT_CONFIG_PARAMETERS
+git pull origin SahilPatil266-API
+bash runpod_start.sh --restart
+```
+
+## What the script does
+
+1. **System checks**: installs `git`/`curl` if missing, warns if Python isn't 3.10 to 3.12 or no GPU is visible, and stops early if there isn't about 15 GB of disk for models.
+2. **Shell defaults**: writes the environment settings into `~/.bashrc` so new terminals have them.
+3. **Python packages**: removes packages that break imports (jax, TensorFlow, wandb, peft), installs the evaluation stack if it's missing, and re-applies the version pins COMET needs (numpy 1.26.4, transformers 4.39.3, tokenizers 0.15.2, protobuf 4.25.9, accelerate 0.27.2, huggingface_hub 0.36.2, torchmetrics 0.10.3). `unbabel-comet` 2.2.7 and `sentence-transformers` 5.7.0 are installed without dependencies because their declared requirements conflict with the pins even though they work with them.
+4. **Library fixes**: patches faster-whisper for PyAV 14+ (otherwise every evaluation fails with "unexpected keyword argument 'metadata_errors'"), and puts torch's CUDA 12 libraries where Whisper can find them.
+5. **MetricX**: clones Google's MetricX at the pinned commit `fc4978e` into `/opt/metricx` and links `API/metricx` to it. It can't live on `/workspace` because git needs to change file permissions there.
+6. **Models**: downloads all seven models into `/root/hf-cache` on the pod's own disk and checks no file is empty, re-downloading any that are.
+7. **API** on port 8000, started detached so closing the terminal doesn't stop it. If the process dies during startup, the script shows the log immediately instead of waiting.
+8. **Dashboard** on port 8501, with the settings it needs to work through RunPod's proxy.
+
+Only one copy of the script can run at a time.
+
+## Why models are not kept on /workspace
+
+The shared `/workspace` volume served model files as **empty** to a newly created pod, then showed their real contents minutes later. The API crashed on startup reading an "empty" Whisper model. Local disk avoids that and also loads faster. The cost is a re-download (a few minutes) whenever a pod is recreated. To use a different location, set `S2ST_MODEL_CACHE=/some/path` before running the script.
+
+## What survives what
+
+| Event | What's lost | Fix |
+|---|---|---|
+| Closing the browser or terminal | nothing | |
+| Pod restart, or a new pod on the same volume | packages, models, MetricX, running services | run the script |
+| New pod on a new volume | also the repo and stored results | clone, then run the script |
+
+## Known quirks of these pods
+
+- **git**: the pod sets `GIT_CONFIG_PARAMETERS` in a format git rejects, so run `unset GIT_CONFIG_PARAMETERS` first in any new terminal (the script's `~/.bashrc` block does this for you). On `/workspace`, git also can't save branch tracking settings, so pull with `git pull origin SahilPatil266-API`.
+- **PYTHONPATH**: the pod setting contains a literal `${PYTHONPATH:+...}` that RunPod doesn't expand. The script overrides it.
+- **pip cache warning** about `/workspace/.cache/pip` is harmless.
 
 ## Known limits
 
-**No authentication.** Anyone with the URLs can run evaluations on the GPU and read every stored result, transcripts included. Share the links directly with the people who need them. An API key is the next thing to add.
-
-**One evaluation at a time.** MetricX reads and writes fixed file names (`metricx/results/metricx_api_input.jsonl` and `metricx_api_output.jsonl`), so two simultaneous evaluations can overwrite each other's results.
-
-**The proxy times out after about 100 seconds.** If a request returns `524`, the evaluation may still have finished. Check `tail /workspace/api.log` or the dashboard.
-
-**SQLite on a network volume.** `evaluations.db` lives on `/workspace`. If the log ever shows "database is locked", restart the API with `EVAL_DB_PATH=/root/evaluations.db` set. That moves the database to the container disk, which means it no longer survives restarts.
+- **No authentication.** Anyone with the URLs can run evaluations and read stored results. Share links only with people who need them.
+- **One evaluation at a time.** MetricX uses fixed file names, so simultaneous requests can overwrite each other.
+- **Proxy timeout about 100 seconds.** A `524` error may still mean the evaluation finished; check the dashboard or the API log.
 
 ## Troubleshooting
 
-To see what's running:
+Logs are in `/workspace/logs/api.log` and `/workspace/logs/ui.log`.
 
-```bash
-pgrep -af "[u]vicorn|[s]treamlit"
-curl -s localhost:8000/health; echo
-tail -30 /workspace/api.log
-tail -20 /workspace/ui.log
-```
-
-If the RunPod page says "Waiting for service to respond", the service on that port isn't running. Run the start script.
-
-If an evaluation returns a 500 error mentioning `metricx24.predict`, MetricX failed but its error is hidden by the API. Run it by hand to see the real message:
+If an evaluation fails with a 500 error mentioning `metricx24.predict`, run MetricX by hand to see its real error:
 
 ```bash
 cd /workspace/compnova-translationevals/API/metricx
-python -m metricx24.predict --tokenizer google/mt5-xl \
+HF_HOME=/root/hf-cache python -m metricx24.predict --tokenizer google/mt5-xl \
   --model_name_or_path google/metricx-24-hybrid-large-v2p6-bfloat16 \
   --max_input_length 1536 --batch_size 1 \
   --input_file results/metricx_api_input.jsonl \
   --output_file results/metricx_api_output.jsonl --qe 2>&1 | tail -25
 ```
 
-To restart everything from scratch, stop both services and run the script:
-
-```bash
-pkill -f "[u]vicorn api:app"; pkill -f "[s]treamlit run"
-bash /workspace/compnova-translationevals/API/runpod_start.sh
-```
+If a model fails to download with "access denied", the token's Hugging Face account hasn't accepted that model's terms.
 
 ## To do
 
-Add `datasets` to the GPU Dockerfile. Remove `librosa`, `soundfile`, `gTTS` and `plotly` from the demo's `requirements.txt` (the dashboard now needs only `streamlit`, `altair`, `requests` and `pandas`). Add an API key. Give MetricX's input and output files a unique name per request. Fix the pod's `PYTHONPATH` setting at the next planned restart.
+Add an API key. Give MetricX's files a unique name per request. Add `datasets` to the GPU Dockerfile. Trim the dashboard's `requirements.txt` to `streamlit`, `altair`, `requests`, `pandas`.

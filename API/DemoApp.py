@@ -4,10 +4,10 @@ This app loads no models and evaluates nothing itself. Audio pairs are
 evaluated by POSTing them to the API's /evaluate endpoint; this app lists
 and displays the stored results via GET /evaluations and GET /evaluations/{id}.
 
-Requirements: streamlit (1.35+), altair, requests, pandas.
+Requirements: streamlit, altair, requests, pandas.
 """
+import html
 import os
-import time
 from datetime import datetime
 
 import altair as alt
@@ -29,6 +29,22 @@ def api_get(base_url, path, **params):
     resp = requests.get(f"{base_url}{path}", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_health(base_url):
+    return api_get(base_url, "/health")
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_list(base_url, limit):
+    return api_get(base_url, "/evaluations", limit=limit)
+
+
+@st.cache_data(max_entries=50, show_spinner=False)
+def cached_record(base_url, eval_id):
+    """A stored evaluation never changes, so it is cached until the app restarts."""
+    return api_get(base_url, f"/evaluations/{eval_id}")
 
 
 def fmt_time(ts):
@@ -74,62 +90,29 @@ def render_summary(summary):
             st.json(nested)
 
 
-def scroll_to(anchor_id):
-    """Scroll the page to an element id. The timestamp forces the script to re-run."""
-    components.html(
-        f"""<script>
-        const el = window.parent.document.getElementById("{anchor_id}");
-        if (el) el.scrollIntoView({{behavior: "smooth", block: "start"}});
-        // {time.time()}
-        </script>""",
-        height=0,
-    )
-
-
-def selected_chunk_from(event):
-    """Pull the clicked chunk number out of a Streamlit chart selection event."""
-    try:
-        picked = event.selection.get("pick")
-    except AttributeError:
-        return None
-    if isinstance(picked, list) and picked:
-        value = picked[0].get("chunk")
-    elif isinstance(picked, dict) and picked.get("chunk"):
-        value = picked["chunk"]
-        value = value[0] if isinstance(value, list) else value
-    else:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def render_score_chart(scores, flagged, eval_id):
-    """Clickable per-chunk chart. Returns the clicked chunk number, or None."""
+def build_score_chart(scores, flagged):
+    """Altair chart spec for the per-chunk scores (rendered in the browser, not by Streamlit)."""
     long = (
         scores.reset_index()
         .melt(id_vars="chunk", var_name="metric", value_name="score")
         .dropna()
     )
-    pick = alt.selection_point(name="pick", fields=["chunk"], on="click",
-                               nearest=True, empty=False)
     base = alt.Chart(long).encode(
         x=alt.X("chunk:Q", title="Chunk", axis=alt.Axis(tickMinStep=1, format="d")),
         y=alt.Y("score:Q", title="Score (higher is better)", scale=alt.Scale(domain=[0, 1])),
         color=alt.Color("metric:N", title=None, legend=alt.Legend(orient="top")),
     )
-    lines = base.mark_line()
-    points = base.mark_point(filled=True, cursor="pointer").encode(
-        size=alt.condition(pick, alt.value(180), alt.value(45)),
-        tooltip=[
-            alt.Tooltip("chunk:Q", title="Chunk", format="d"),
-            alt.Tooltip("metric:N", title="Metric"),
-            alt.Tooltip("score:Q", title="Score", format=".3f"),
-        ],
-    ).add_params(pick)
-    layers = [lines, points]
-
+    tooltip = [
+        alt.Tooltip("chunk:Q", title="Chunk", format="d"),
+        alt.Tooltip("metric:N", title="Metric"),
+        alt.Tooltip("score:Q", title="Score", format=".3f"),
+    ]
+    layers = [
+        base.mark_line(),
+        base.mark_point(filled=True, size=60).encode(tooltip=tooltip),
+        # Large invisible targets so a click doesn't have to land exactly on a point.
+        base.mark_point(size=500, opacity=0.001, cursor="pointer").encode(tooltip=tooltip),
+    ]
     flagged_points = long[(long["metric"] == "COMET-Kiwi") & long["chunk"].isin(flagged)]
     if not flagged_points.empty:
         layers.append(
@@ -137,38 +120,89 @@ def render_score_chart(scores, flagged, eval_id):
             .mark_point(shape="diamond", size=220, color="#d62728", strokeWidth=2)
             .encode(x="chunk:Q", y="score:Q")
         )
-
-    chart = alt.layer(*layers).properties(height=320, width="container")
-    event = st.altair_chart(chart, on_select="rerun", selection_mode="pick",
-                            key=f"chart_{eval_id}")
-    return selected_chunk_from(event)
+    return alt.layer(*layers).properties(height=300, width="container")
 
 
-def render_chunk_details(df, comet_col, flagged, selected):
-    st.subheader("Chunk details")
+def render_interactive_chunks(chart, df, comet_col, flagged):
+    """Chart plus chunk list in one browser-side component.
+
+    Clicking a point opens and scrolls to that chunk entirely in the browser,
+    so there is no Streamlit rerun and no round trip to the server.
+    """
     text_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+    items = []
     for i, row in df.iterrows():
-        st.markdown(f"<div id='chunk-{i}'></div>", unsafe_allow_html=True)
         label = f"Chunk {i}"
         if comet_col:
             label += f", COMET {row[comet_col]:.3f}"
         if i in flagged:
             label += ", below threshold"
-        if i == selected:
-            label = f"Selected: {label}"  # new label = new element, so it opens expanded
-        with st.expander(label, expanded=(i == selected)):
-            for col in text_cols:
-                st.markdown(f"**{col}**")
-                st.write(str(row[col]))
-            if num_cols:
-                st.caption(", ".join(
-                    f"{col}: {row[col]:.3f}" if isinstance(row[col], float) else f"{col}: {row[col]}"
-                    for col in num_cols
-                ))
+        # Transcript text comes from audio we don't control, so it is always escaped.
+        fields = "".join(
+            f"<div class='field'><div class='name'>{html.escape(str(c))}</div>"
+            f"<div>{html.escape(str(row[c]))}</div></div>"
+            for c in text_cols
+        )
+        nums = ", ".join(
+            f"{c}: {row[c]:.3f}" if isinstance(row[c], float) else f"{c}: {row[c]}"
+            for c in num_cols
+        )
+        css_class = "flag" if i in flagged else ""
+        items.append(
+            f"<details id='chunk-{i}' class='{css_class}'>"
+            f"<summary>{html.escape(label)}</summary>{fields}"
+            f"<div class='nums'>{html.escape(nums)}</div></details>"
+        )
+
+    page = f"""
+<style>
+  :root {{ color-scheme: light dark; --fg:#1f2328; --muted:#6b7280; --line:#d0d7de; --flag:rgba(255,75,75,.14); --sel:rgba(60,130,255,.18); }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --fg:#e6edf3; --muted:#9aa4af; --line:#30363d; }} }}
+  body {{ margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg); background:transparent; }}
+  #chart {{ width:100%; }}
+  .hint {{ color:var(--muted); font-size:13px; margin:4px 0 12px; }}
+  h3 {{ font-size:17px; margin:8px 0; }}
+  details {{ border:1px solid var(--line); border-radius:6px; margin:6px 0; padding:6px 10px; }}
+  details.flag {{ background:var(--flag); }}
+  details.sel {{ background:var(--sel); outline:2px solid #3c82ff; }}
+  summary {{ cursor:pointer; font-weight:600; }}
+  .field {{ margin:8px 0; }}
+  .name {{ font-size:12px; color:var(--muted); }}
+  .nums {{ font-size:12px; color:var(--muted); margin-top:6px; }}
+</style>
+<div id="chart"></div>
+<p class="hint">Click a point to open that chunk below.</p>
+<h3>Chunk details</h3>
+<div id="list">{''.join(items)}</div>
+<script src="https://cdn.jsdelivr.net/npm/vega@6"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@6"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@7"></script>
+<script>
+  const spec = {chart.to_json()};
+  vegaEmbed("#chart", spec, {{actions: false}}).then(result => {{
+    result.view.addEventListener("click", (event, item) => {{
+      if (!item || !item.datum || item.datum.chunk === undefined) return;
+      const el = document.getElementById("chunk-" + Math.round(item.datum.chunk));
+      if (!el) return;
+      document.querySelectorAll("details.sel").forEach(d => d.classList.remove("sel"));
+      el.open = true;
+      el.classList.add("sel");
+      el.scrollIntoView({{behavior: "smooth", block: "start"}});
+    }});
+  }}).catch(err => {{
+    document.getElementById("chart").textContent = "Chart failed to load: " + err;
+  }});
+</script>
+"""
+    if hasattr(st, "iframe"):  # newer Streamlit; components.html is being retired
+        st.iframe(page, height=900)
+    else:
+        components.html(page, height=900, scrolling=True)
 
 
-def render_chunks(chunks, eval_id):
+def render_chunks(chunks):
     st.subheader("Per-chunk scores")
     if not chunks:
         st.info("This evaluation has no aligned chunks.")
@@ -201,24 +235,19 @@ def render_chunks(chunks, eval_id):
         else:
             st.success(f"No chunks scored below COMET {COMET_FLAG_THRESHOLD}.")
 
-    selected = None
     if len(scores.columns):
-        selected = render_score_chart(scores, flagged, eval_id)
-        st.caption("Click a point to open that chunk below. Click empty space to clear.")
+        render_interactive_chunks(build_score_chart(scores, flagged), df, comet_col, flagged)
     else:
         st.caption("No COMET or MetricX columns found in the chunk data, so there is no chart.")
 
-    def highlight(row):
-        if row.name == selected:
-            return ["background-color: rgba(60, 130, 255, 0.22)"] * len(row)
-        if comet_col and row[comet_col] < COMET_FLAG_THRESHOLD:
-            return ["background-color: rgba(255, 75, 75, 0.18)"] * len(row)
-        return [""] * len(row)
-    st.dataframe(df.style.apply(highlight, axis=1).format(precision=3))
-
-    render_chunk_details(df, comet_col, flagged, selected)
-    if selected is not None:
-        scroll_to(f"chunk-{selected}")
+    with st.expander("All chunks as a table"):
+        if comet_col:
+            def highlight(row):
+                bad = row[comet_col] < COMET_FLAG_THRESHOLD
+                return ["background-color: rgba(255, 75, 75, 0.18)" if bad else ""] * len(row)
+            st.dataframe(df.style.apply(highlight, axis=1).format(precision=3))
+        else:
+            st.dataframe(df)
 
 
 def render_transcripts(transcripts, eval_id):
@@ -262,19 +291,21 @@ with st.sidebar:
     api_url = st.text_input("Evaluation API URL", DEFAULT_API_URL).rstrip("/")
     follow_latest = st.toggle("Always show the latest evaluation", value=True)
     limit = st.slider("Evaluations to list", 5, 50, 20)
-    st.button("Refresh")  # any interaction reruns the script and re-fetches
+    if st.button("Refresh"):
+        cached_health.clear()
+        cached_list.clear()
 
 st.title("S2ST evaluation monitor")
 st.caption("Results from the evaluation API. Send audio pairs to POST /evaluate to add more.")
 
 try:
-    api_get(api_url, "/health")
+    cached_health(api_url)
 except requests.RequestException as e:
     st.error(f"Can't reach the API at {api_url}. Check that it is running and the URL is right. ({e})")
     st.stop()
 
 try:
-    recent = api_get(api_url, "/evaluations", limit=limit)
+    recent = cached_list(api_url, limit)
 except requests.RequestException as e:
     st.error(f"The API is up but listing evaluations failed. Does it have the /evaluations endpoint? ({e})")
     st.stop()
@@ -290,7 +321,7 @@ else:
     selected = st.selectbox("Evaluation (newest first)", list(labels), format_func=labels.get)
 
 try:
-    record = api_get(api_url, f"/evaluations/{selected}")
+    record = cached_record(api_url, selected)
 except requests.RequestException as e:
     st.error(f"Couldn't load evaluation {selected}. ({e})")
     st.stop()
@@ -302,7 +333,7 @@ st.markdown(
 )
 
 render_summary(result.get("summary"))
-render_chunks(result.get("chunks"), record["id"])
+render_chunks(result.get("chunks"))
 render_transcripts(result.get("transcripts"), record["id"])
 render_unmatched(result.get("unmatched"))
 
