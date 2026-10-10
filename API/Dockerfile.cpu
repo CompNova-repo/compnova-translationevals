@@ -1,0 +1,66 @@
+
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    USE_TF=NO \
+    USE_JAX=NO
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Step 1: Cython pin - fixes an old PyYAML (5.3.1) build failure.
+RUN pip install --no-cache-dir "cython<3.0.0"
+
+# Step 2: PyTorch, CPU-only wheels. --extra-index-url (not --index-url) -
+# using --index-url alone restricts pip to ONLY that index for every
+# package including transitive deps like typing-extensions, which fails
+# when that index lacks a build dependency (flit_core) PyPI would have had.
+RUN pip install --no-cache-dir torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Step 3: COMET, pinned and isolated with --no-deps.
+RUN pip install --no-cache-dir "unbabel-comet==2.2.7" --no-deps
+RUN pip install --no-cache-dir entmax "jsonargparse==3.13.1" pytorch-lightning sacrebleu torchmetrics
+
+# Step 4: force the exact versions COMET needs - LAST thing that touches
+# these six packages before the app runs.
+RUN pip install --no-cache-dir \
+    "numpy==1.26.4" "protobuf==4.25.9" "huggingface_hub==0.36.2" \
+    "tokenizers==0.15.2" "transformers==4.39.3" "torchmetrics==0.10.3" \
+    "accelerate==0.27.2" \
+    --force-reinstall --no-deps
+
+# Step 5: app requirements, still --no-deps throughout.
+COPY requirements-api.txt .
+RUN pip install --no-cache-dir -r requirements-api.txt --no-deps
+RUN pip install --no-cache-dir av ctranslate2 onnxruntime sentence-transformers safetensors --no-deps
+
+# FastAPI/Starlette/Uvicorn/Pydantic/huggingface_hub's own required
+# sub-dependencies, skipped by --no-deps above along with everything
+# else. Web framework + basic HTTP internals, not ML packages, so no
+# version conflict risk with the COMET pin. Deliberately NOT --no-deps
+# here - let pip pull each package's own small dependency tree normally
+# instead of finding gaps one at a time.
+RUN pip install --no-cache-dir click h11 starlette anyio sniffio idna \
+    pydantic pydantic-core annotated_doc annotated-types requests \
+    pytz python-dateutil
+
+# Step 6: remove optional packages that transformers.Trainer probes for
+# and crashes on with this pin - none needed for inference. jax/peft/
+# wandb all confirmed necessary removals through today's debugging;
+# tensorflow removed preemptively for the same reason.
+RUN pip uninstall -y jax jaxlib peft tensorflow tensorflow-cpu keras wandb 2>/dev/null || true
+
+# MetricX: research code, not on PyPI, cloned at build time and pinned.
+RUN git clone https://github.com/google-research/metricx.git /app/metricx \
+    && git -C /app/metricx checkout fc4978eb064670f7cc33e93ea4f52d38396b8ae6
+
+COPY eval_core.py api.py ./
+
+EXPOSE 8000
+
+# Pass your Hugging Face token at run time:
+#   docker run -p 8000:8000 -e HF_TOKEN=hf_your_token compnova-eval-api-cpu
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
