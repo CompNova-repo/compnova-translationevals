@@ -15,7 +15,8 @@ Dockerfile      GPU image (CUDA 12.1)
 Dockerfile.cpu  CPU image (python:3.10-slim)
 constraints.txt The versions that are known to work together - one source of truth
 runpod_start.sh One-shot setup + start on a RunPod pod, and the cron installer
-verify_setup.sh End-to-end check of the whole system
+verify_setup.sh End-to-end check of the whole system (run it on the pod)
+test_api.py     Offline test harness - 56 checks, no GPU needed
 requirements-api.txt
 ```
 
@@ -52,6 +53,17 @@ curl -s -X POST http://localhost:8000/jobs \
 ```
 
 Interactive docs: `http://<host>:8000/docs`.
+
+## Testing it
+
+```bash
+# offline: no GPU, no models, no network - 56 checks over the whole HTTP surface
+pip install fastapi httpx numpy python-multipart
+python3 API/test_api.py
+
+# on the pod: the real thing, end to end
+bash API/verify_setup.sh
+```
 
 ## Four things to know before you build on this
 
