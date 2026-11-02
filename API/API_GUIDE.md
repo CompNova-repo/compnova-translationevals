@@ -2,10 +2,37 @@
 
 **Audience:** engineers integrating the evaluation service into a pipeline (cron, CI,
 batch runner, back office).
-**Version:** 2.0.0
+**Version:** 2.1.0
 
 Everything here is verified against the code in this directory
 (`api.py`, `config.py`, `errors.py`, `eval_core.py`, `eval_store.py`).
+
+---
+
+## 0. What is new in 2.1
+
+| Change | Where |
+|---|---|
+| **Speech Emotion Recognition** is part of the evaluation. `ser_match_score` (cosine similarity over the 8-class emotion distribution) plus `source_emotion_top1` / `target_emotion_top1`, at the top level and in `summary`. | `POST /evaluate`, `POST /jobs` |
+| **Audio is validated on ingest.** Corrupt files are rejected with `422`; non-16 kHz / multi-channel audio is resampled to 16 kHz mono. | every upload |
+| **Every route is also served at `/api/v1/…`**, and every response carries an `X-API-Version` header. | all routes |
+| **`Authorization: Bearer <key>`** is accepted alongside `X-API-Key`. | all routes except the probes |
+| **Poison-pill isolation.** If a batch of jobs fails, each job is retried alone, so one bad file cannot fail its neighbours. | `POST /jobs` |
+| **Rolling quality window** — mean COMET / MetricX / SER and latency percentiles over the last `EVAL_METRICS_HISTORY` evaluations. | `GET /metrics` |
+| **Prometheus output** at `GET /metrics?format=prometheus` and `GET /metrics/prometheus`. | `GET /metrics` |
+| **Automatic retention sweep** removes expired evaluations and finished jobs when `EVAL_RETENTION_DAYS > 0`. | background |
+| **Jobs survive a crash.** `fail_stale_jobs_on_startup()` marks jobs left `queued`/`running` by a dead process as `failed` with `SERVICE_RESTARTED`. | startup |
+| **Job `state` aliases** — `queued`/`running`/`done` are also exposed as `pending`/`processing`/`completed`. | `GET /jobs` |
+| **`INSUFFICIENT_DISK`** — a full spool is no longer reported as `GPU_OUT_OF_MEMORY`. | errors |
+
+> [!warning] The SER checkpoint is English-only
+> `ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition` was trained on English
+> speech. Same-language accuracy is reported around 0.93; cross-lingual around 0.46 —
+> which is why the Streamlit playground shipped with SER switched off. For a
+> cross-lingual pair (EN → ES) the **target**-side emotion is out of distribution, so
+> `ser_match_score` is **not** a translation-quality signal. Set `EVAL_SER_ENABLED=0`
+> to turn it off, or treat the score as advisory. `/health/ready` reports
+> `ser_model_language` so a client can tell.
 
 ---
 
@@ -84,7 +111,15 @@ Everything is read from the environment once, at import time — see `config.py`
 | `EVAL_MAX_UPLOAD_MB` | `200` | Largest accepted upload. |
 | `EVAL_MAX_AUDIO_SECONDS` | `1800` | Longest accepted clip. |
 | `EVAL_TRANSLATE_ENABLED` | `1` | Set to `0` to disable the translation models entirely (they are only loaded on demand anyway). |
-| `EVAL_RETENTION_DAYS` | `0` | `0` = keep results forever. |
+| `EVAL_RETENTION_DAYS` | `0` | `0` = keep results forever. Above 0, an hourly sweep removes expired evaluations and finished jobs. |
+| `EVAL_SER_ENABLED` | `1` | Speech Emotion Recognition. The checkpoint is **English-only** — see the warning at the top. |
+| `EVAL_SER_MODEL_LANGUAGE` | `en` | The language the SER checkpoint was trained on. Reported by `/health/ready`. |
+| `EVAL_AUTO_RESAMPLE_16K` | `1` | Resample uploads to 16 kHz mono instead of rejecting them. |
+| `EVAL_EXPECTED_SAMPLE_RATE` | `16000` | The sample rate the pipeline expects. |
+| `EVAL_EXPECTED_CHANNELS` | `1` | The channel count the pipeline expects. |
+| `EVAL_MIN_FREE_DISK_MB` | `2048` | Refuse uploads below this much free space (`INSUFFICIENT_DISK`). |
+| `EVAL_METRICS_HISTORY` | `500` | How many evaluations the rolling quality window covers. |
+| `EVAL_LOG_FORMAT` | `text` | `json` emits one structured line per completed evaluation. |
 | `EVAL_CORS_ORIGINS` | *(empty)* | Extra browser origins. Not needed for server-to-server use. |
 | `METRICX_DIR` | auto-detected | Where the MetricX-24 checkout lives. |
 | `EVAL_API_URL` | `http://localhost:8000` | Read by the **dashboard** and the **cron runner**, not the API. |
@@ -316,12 +351,27 @@ Evaluate a source/target pair end to end and wait for the result.
     "source": "Good morning everyone, welcome to the quarterly review.",
     "target": "Buenos días a todos, bienvenidos a la revisión trimestral."
   },
+  "comet_score": 0.8123,
+  "metricx_score": 4.321,
+  "ser_match_score": 0.92,
+  "source_emotion_top1": "neutral",
+  "target_emotion_top1": "calm",
   "summary": {
     "chunks": 12,
     "unmatched": 1,
     "comet_kiwi": 0.8123,
     "metricx_24": 4.321,
-    "sentiment_agreement_pct": 83.3
+    "sentiment_agreement_pct": 83.3,
+    "ser_match_score": 0.92,
+    "source_emotion_top1": "neutral",
+    "target_emotion_top1": "calm"
+  },
+  "ser": {
+    "ser_match_score": 0.92,
+    "source_emotion_top1": "neutral",
+    "target_emotion_top1": "calm",
+    "source_distribution": [{"label": "neutral", "score": 0.81}, ...],
+    "target_distribution": [{"label": "calm", "score": 0.74}, ...]
   },
   "chunks": [
     {
@@ -361,6 +411,10 @@ Evaluate a source/target pair end to end and wait for the result.
 | `summary.comet_kiwi` | float \| null | Mean COMET-Kiwi over all chunks. **0–1, higher is better.** |
 | `summary.metricx_24` | float \| null | Mean MetricX-24 QE. **0–25, lower is better.** |
 | `summary.sentiment_agreement_pct` | float \| null | % of chunks where source and target sentiment labels are identical. |
+| `summary.ser_match_score` | float \| null | Cosine similarity over the 8-class emotion distributions (0–1, higher = more alike). `null` when SER is off or failed. |
+| `summary.source_emotion_top1` / `.target_emotion_top1` | string \| null | The top-1 emotion label on each side. |
+| `comet_score` / `metricx_score` | float \| null | Top-level aliases of `summary.comet_kiwi` / `summary.metricx_24`. **`metricx_score` is the raw 0–25 value** — the dashboard plots `1 - score/25` to put it on COMET's 0–1 axis. |
+| `ser` | object | The full SER block: both probability distributions plus the score and the top-1 labels. |
 | `chunks[]` | array | One entry per aligned chunk. |
 | `chunks[].sentiment_match` | bool \| null | `true` if both labels are present and equal. |
 | `unmatched.source` / `.target` | string[] | The segment texts that could not be aligned, verbatim. |
@@ -379,6 +433,7 @@ Evaluate a source/target pair end to end and wait for the result.
 | `415` | `UNSUPPORTED_AUDIO` | The file extension is not an accepted audio format. |
 | `422` | `VALIDATION_ERROR` | Missing field, out-of-range parameter, or a clip longer than `EVAL_MAX_AUDIO_SECONDS`. |
 | `503` | `GPU_OUT_OF_MEMORY` | The GPU ran out of memory. **Retryable.** |
+| `507` | `INSUFFICIENT_DISK` | The spool or the database volume is full. **Not retryable** — an operator has to free the disk. |
 | `503` | `MODEL_UNAVAILABLE` | The models are still loading, or one failed. Check `/health/ready`. |
 | `503` | `BUSY` | Transient failure. **Retryable.** |
 | `504` | `TIMEOUT` | The evaluation took too long. **Retryable.** |
@@ -527,7 +582,8 @@ you implement a retention policy.
 |---|---|---|---|
 | `GET` | `/health` | no | Liveness |
 | `GET` | `/health/ready` | no | Readiness + model status |
-| `GET` | `/metrics` | no | Counters |
+| `GET` | `/metrics` | no | Counters + the rolling quality window |
+| `GET` | `/metrics/prometheus` | no | The same counters in Prometheus text format |
 | `POST` | `/transcribe` | yes | Transcript only |
 | `POST` | `/translate` | yes | Translate audio |
 | `POST` | `/evaluate` | yes | Evaluate, blocking |
@@ -589,6 +645,7 @@ already **failed**, in which case a new one is created so a genuine retry is pos
 | **COMET-Kiwi** (`wmt22-cometkiwi-da`) | 0 – 1 | higher is better | Reference-free semantic adequacy + fluency. The dashboard flags chunks below **0.40**. |
 | **MetricX-24 QE** | 0 – 25 | **lower** is better | Reference-free error-density proxy. The dashboard plots `1 - score/25` so it lands on COMET's 0–1 axis. |
 | **`sentiment_agreement_pct`** | 0 – 100 | higher is better | % of aligned chunks where the 5-class label is identical on both sides. |
+| **`ser_match_score`** | 0 – 1 | higher is better | Cosine similarity between the source and target 8-class emotion distributions. **English-only checkpoint** — see the warning in §0. |
 | **`summary.unmatched`** | count | lower is better | Segments that could not be aligned. Non-zero is a **red flag for omission**. |
 
 Both quality metrics are **reference-free** — no human reference transcript is needed,
@@ -827,8 +884,10 @@ Full details and troubleshooting in [`RUNPOD_SETUP.md`](RUNPOD_SETUP.md).
 
 ## 12. Versioning
 
-The app reports `version="2.0.0"`. There is **no versioned URL prefix** (`/v1/...`)
-yet.
+The app reports `version="2.1.0"`. Every route is served at **both** `/<path>` and
+`/api/v1/<path>`, and every response carries an `X-API-Version` header. The un-prefixed
+paths are kept for compatibility with earlier clients; new clients should use
+`/api/v1`.
 
 **What changed in 2.0** (and what a client might notice)
 
@@ -841,7 +900,11 @@ yet.
 | `POST /jobs` added | Additive. |
 | `POST /translate` added | Additive. |
 | `X-Request-Id` honoured | Additive. |
-| `GET /health/ready`, `GET /metrics` added | Additive. |
+| `GET /health/ready`, `GET /metrics`, `GET /metrics/prometheus` added | Additive. |
+| `ser_match_score`, `source_emotion_top1`, `target_emotion_top1`, `ser` added | Additive. |
+| Every route also served at `/api/v1/…` | Additive. |
+| `Authorization: Bearer` accepted alongside `X-API-Key` | Additive. |
+| `INSUFFICIENT_DISK` added to the error codes | Additive. |
 | The dashboard gained an upload tab | Additive. |
 
 Pin the **git SHA of the API host** rather than the version string, and record it

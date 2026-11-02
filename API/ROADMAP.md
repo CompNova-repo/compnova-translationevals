@@ -2,8 +2,13 @@
 
 Companion to [`API_GUIDE.md`](API_GUIDE.md).
 
-**Status as of version 2.0.0:** the P0 and P1 items from the original roadmap are
-implemented. This document records what was done and what is still open.
+**Status as of version 2.1.0:** the P0 and P1 items from the original roadmap are
+implemented, and 2.1 adds Speech Emotion Recognition, audio validation and
+normalisation, `/api/v1`, Prometheus output, a rolling quality window, automatic
+retention, crash recovery for in-flight jobs, and poison-pill isolation in the batch
+worker.
+
+This document records what was done and what is still open.
 
 ---
 
@@ -181,18 +186,35 @@ would let a pod be monitored by a standard scraper.
 The API key authenticates a client but does not cap how much it can ask for. A
 per-key limit would protect the GPU from a runaway client.
 
-### 2.7 No `/v1` URL prefix
+### 2.7 ~~No `/v1` URL prefix~~ — done in 2.1
 
-Version 2.0 changed two response shapes (the `/evaluations` envelope and the error
-body). There is no versioned prefix, so a future breaking change needs either a
-prefix or a coordinated cut-over. `X-API-Version` on the response headers would be a
-cheap interim.
+Every route is now served at both `/<path>` and `/api/v1/<path>`, and every response
+carries an `X-API-Version` header. The un-prefixed paths are kept for compatibility
+with earlier clients.
 
-### 2.8 SER is not in the API
+### 2.8 ~~SER is not in the API~~ — done in 2.1, with a caveat
 
-The playground's Speech Emotion Recognition classifier is English-only and was
-disabled upstream (`ENABLE_SER = False`). The API's sentiment comparison is text-based.
-Adding audio-based emotion scoring needs a multilingual checkpoint first.
+The wav2vec2 SER classifier is in the pipeline, and `ser_match_score` is reported
+alongside COMET and MetricX.
+
+> [!warning] The checkpoint is English-only
+> `ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition` reports roughly 0.93
+> same-language accuracy and roughly 0.46 cross-lingual — which is why the
+> Streamlit playground shipped with SER switched off. For a cross-lingual pair the
+> **target**-side emotion is out of distribution, so the score is not a
+> translation-quality signal. It is on by default (`EVAL_SER_ENABLED=1`), the service
+> warns at startup, and `/health/ready` reports `ser_model_language`.
+
+### 2.9 Per-job timings are batch timings
+
+`timings` and `duration_s` are measured for the whole batch and shared by every job
+in it, so a job's `duration_s` is the batch average rather than its own. Fine for
+throughput planning, misleading if you try to attribute a slow job.
+
+### 2.10 The rolling quality window is in memory only
+
+`/metrics` keeps the last `EVAL_METRICS_HISTORY` evaluations in a process-local
+deque. It resets on restart and is not shared between workers.
 
 ---
 

@@ -14,6 +14,10 @@ Design notes
   block the writer.
 * Every statement is parameterised. Filenames supplied by a client are
   stored as-is and never interpolated into SQL.
+* Job status values support both internal canonical names (``queued``,
+  ``running``, ``done``, ``failed``, ``cancelled``) and the architectural
+  specification aliases (``pending``, ``processing``, ``completed``,
+  ``failed``).
 """
 import json
 import os
@@ -30,6 +34,31 @@ _lock = threading.Lock()
 
 EVALUATIONS = "evaluations"
 JOBS = "jobs"
+
+# Map between internal job statuses and the architectural doc status names
+STATUS_TO_SPEC = {
+    "queued": "pending",
+    "running": "processing",
+    "done": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+SPEC_TO_STATUS = {
+    "pending": "queued",
+    "processing": "running",
+    "completed": "done",
+    "queued": "queued",
+    "running": "running",
+    "done": "done",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
+
+def normalise_job_status(status: str | None) -> str | None:
+    if not status:
+        return None
+    return SPEC_TO_STATUS.get(status.strip().lower(), status.strip().lower())
 
 
 def _connect() -> sqlite3.Connection:
@@ -283,9 +312,13 @@ def delete_evaluation(eval_id: str) -> bool:
 
 
 def delete_before(cutoff: float) -> int:
-    """Retention sweep: remove evaluations created before `cutoff`."""
+    """Retention sweep: remove evaluations and finished jobs created before `cutoff`."""
     with _lock, closing(_connect()) as conn:
         cur = conn.execute("DELETE FROM evaluations WHERE created_at < ?", (cutoff,))
+        conn.execute(
+            "DELETE FROM jobs WHERE created_at < ? AND status IN ('done', 'failed', 'cancelled')",
+            (cutoff,),
+        )
         conn.commit()
         return cur.rowcount
 
@@ -329,6 +362,8 @@ def update_job(job_id: str, **fields) -> None:
         "source_name", "target_name",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
+    if "status" in updates and updates["status"]:
+        updates["status"] = normalise_job_status(updates["status"])
     if not updates:
         return
     assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -340,6 +375,24 @@ def update_job(job_id: str, **fields) -> None:
         conn.commit()
 
 
+def fail_stale_jobs_on_startup() -> int:
+    """Mark in-flight jobs left over from a previous crashed process as failed."""
+    now = time.time()
+    err = json.dumps({
+        "code": "SERVICE_RESTARTED",
+        "message": "The service restarted while this job was queued or running.",
+        "retryable": True,
+    })
+    with _lock, closing(_connect()) as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error_json = ? "
+            "WHERE status IN ('queued', 'running', 'pending', 'processing')",
+            (now, err),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def get_job(job_id: str) -> dict | None:
     with closing(_connect()) as conn:
         row = conn.execute(
@@ -347,12 +400,14 @@ def get_job(job_id: str) -> dict | None:
         ).fetchone()
     if row is None:
         return None
+    status = row["status"]
     return {
         "job_id": row["job_id"],
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
-        "status": row["status"],
+        "status": status,
+        "state": STATUS_TO_SPEC.get(status, status),
         "source_name": row["source_name"],
         "target_name": row["target_name"],
         "request_id": row["request_id"],
@@ -380,8 +435,9 @@ def list_jobs(
     offset = max(0, int(offset))
     where, params = [], []
     if status:
+        norm = normalise_job_status(status)
         where.append("status = ?")
-        params.append(status)
+        params.append(norm)
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     with closing(_connect()) as conn:
         rows = conn.execute(
@@ -390,16 +446,29 @@ def list_jobs(
             f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["state"] = STATUS_TO_SPEC.get(d["status"], d["status"])
+        out.append(d)
+    return out
 
 
 def job_counts() -> dict:
-    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0}
+    counts = {
+        "queued": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0,
+        "pending": 0, "processing": 0, "completed": 0,
+    }
     with closing(_connect()) as conn:
         for row in conn.execute(
             "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
         ):
-            counts[row["status"]] = row["n"]
+            st = row["status"]
+            n = row["n"]
+            counts[st] = n
+            alias = STATUS_TO_SPEC.get(st)
+            if alias and alias != st:
+                counts[alias] = n
     return counts
 
 

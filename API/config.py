@@ -52,13 +52,13 @@ def _default_db_path() -> str:
 
 # ---------------------------------------------------------------- identity --
 
-API_VERSION = "2.0.0"
+API_VERSION = "2.1.0"
 
 # ------------------------------------------------------------------- auth --
 
-# Comma-separated list of accepted X-API-Key values. EMPTY means the service
-# is OPEN - which is the historical behaviour. Set EVAL_API_KEYS before
-# exposing the service to anyone but the team.
+# Comma-separated list of accepted API keys (accepted via X-API-Key or
+# Authorization: Bearer <key>). EMPTY means the service is OPEN - which is
+# the historical behaviour. Set EVAL_API_KEYS before exposing the service.
 API_KEYS = tuple(
     k.strip()
     for k in os.environ.get("EVAL_API_KEYS", "").split(",")
@@ -86,6 +86,13 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 # Longest clip accepted, in seconds. Guards the GPU against a runaway file.
 MAX_AUDIO_SECONDS = _env_int("EVAL_MAX_AUDIO_SECONDS", 1800)
+
+# Expected pipeline audio format (16 kHz mono waveform). When
+# AUTO_RESAMPLE_16K is enabled, valid audio files with other sample rates or
+# channel counts are automatically resampled to 16 kHz mono WAV on ingestion.
+EXPECTED_SAMPLE_RATE = _env_int("EVAL_EXPECTED_SAMPLE_RATE", 16000)
+EXPECTED_CHANNELS = _env_int("EVAL_EXPECTED_CHANNELS", 1)
+AUTO_RESAMPLE_16K = _env_bool("EVAL_AUTO_RESAMPLE_16K", True)
 
 # Audio extensions we are willing to try to decode.
 ALLOWED_AUDIO_EXTS = frozenset(
@@ -115,6 +122,21 @@ JOB_QUEUE_TIMEOUT_S = _env_float("EVAL_JOB_QUEUE_TIMEOUT_S", 30.0)
 
 MIN_SIMILARITY_DEFAULT = _env_float("EVAL_MIN_SIMILARITY", 0.5)
 MAX_MERGE_DEFAULT = _env_int("EVAL_MAX_MERGE", 2)
+
+# Speech Emotion Recognition (SER) on 16 kHz mono waveforms.
+#
+# IMPORTANT: the checkpoint is English-only
+# (ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition). Same-language
+# accuracy is reported around 0.93, cross-lingual around 0.46 - which is why
+# the Streamlit playground shipped with SER switched off. For a cross-lingual
+# pair (e.g. EN -> ES) the target-side emotion is out of distribution, so
+# ser_match_score is NOT a quality signal for the translation. Turn it on only
+# when the source and target share a language, or treat the score as advisory.
+SER_ENABLED = _env_bool("EVAL_SER_ENABLED", True)
+
+# The language the SER checkpoint was trained on. Surfaced by /health/ready so
+# a client can tell whether ser_match_score is meaningful for its pair.
+SER_MODEL_LANGUAGE = os.environ.get("EVAL_SER_MODEL_LANGUAGE", "en")
 
 # -------------------------------------------------------------- translation --
 
@@ -160,6 +182,7 @@ CORS_ORIGINS = tuple(
 # --------------------------------------------------------------- telemetry --
 
 LOG_LEVEL = os.environ.get("EVAL_LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = os.environ.get("EVAL_LOG_FORMAT", "text").strip().lower()
 
 # Number of evaluations kept in the in-process metrics ring buffer.
 METRICS_HISTORY = _env_int("EVAL_METRICS_HISTORY", 500)
@@ -174,7 +197,8 @@ MIN_FREE_DISK_MB = _env_int("EVAL_MIN_FREE_DISK_MB", 2048)
 
 def free_disk_mb(path: str = "/") -> float:
     try:
-        return shutil.disk_usage(path).free / (1024 * 1024)
+        target = path if os.path.exists(path) else (os.path.dirname(path) or "/")
+        return shutil.disk_usage(target).free / (1024 * 1024)
     except OSError:
         return float("inf")
 
@@ -193,7 +217,14 @@ def describe() -> dict:
         "job_batch_size": JOB_BATCH_SIZE,
         "max_upload_mb": MAX_UPLOAD_MB,
         "max_audio_seconds": MAX_AUDIO_SECONDS,
+        "expected_sample_rate": EXPECTED_SAMPLE_RATE,
+        "expected_channels": EXPECTED_CHANNELS,
+        "auto_resample_16k": AUTO_RESAMPLE_16K,
+        "ser_enabled": SER_ENABLED,
+        "ser_model_language": SER_MODEL_LANGUAGE,
         "translate_enabled": TRANSLATE_ENABLED,
         "metricx_dir": METRICX_PATH,
         "retention_days": RETENTION_DAYS,
+        "metrics_history": METRICS_HISTORY,
+        "log_format": LOG_FORMAT,
     }

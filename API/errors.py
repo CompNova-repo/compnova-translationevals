@@ -80,6 +80,15 @@ def out_of_memory(message: str = "the GPU ran out of memory", **details) -> ApiE
     return ApiError("GPU_OUT_OF_MEMORY", message, 503, True, details or None)
 
 
+def insufficient_disk(message: str = "not enough free disk space", **details) -> ApiError:
+    """The spool or the database volume is full.
+
+    Deliberately NOT retryable: a client that keeps retrying will keep
+    failing until an operator frees the disk.
+    """
+    return ApiError("INSUFFICIENT_DISK", message, 507, False, details or None)
+
+
 def model_unavailable(message: str, **details) -> ApiError:
     return ApiError("MODEL_UNAVAILABLE", message, 503, True, details or None)
 

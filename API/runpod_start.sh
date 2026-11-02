@@ -84,6 +84,7 @@ export EVAL_JOB_BATCH_SIZE="${EVAL_JOB_BATCH_SIZE:-8}"
 export EVAL_MAX_UPLOAD_MB="${EVAL_MAX_UPLOAD_MB:-200}"
 export EVAL_MAX_AUDIO_SECONDS="${EVAL_MAX_AUDIO_SECONDS:-1800}"
 export EVAL_TRANSLATE_ENABLED="${EVAL_TRANSLATE_ENABLED:-1}"
+export EVAL_SER_ENABLED="${EVAL_SER_ENABLED:-1}"
 export EVAL_API_URL="http://localhost:$API_PORT"
 export EVAL_API_KEY="${EVAL_API_KEY:-$EVAL_API_KEYS}"
 
@@ -141,9 +142,19 @@ if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
 else
   info "WARNING: no NVIDIA GPU visible. Everything will run on CPU and be very slow."
 fi
+# How much disk the model cache needs, in GB. These match the download list
+# in step 6 - keep the two in step when a model is added.
+GB_EVAL=11          # whisper + comet + metricx + mt5 tokenizer + LaBSE + sentiment
+GB_SER=3            # wav2vec2 speech emotion recognition
+GB_TRANSLATE=8      # NLLB-200 + SeamlessM4T
+GB_HEADROOM=2        # pip cache, temp files, slack
+REQUIRED_GB=$GB_EVAL
+case "$EVAL_SER_ENABLED" in 0|false|no|FALSE) ;; *) REQUIRED_GB=$((REQUIRED_GB + GB_SER)) ;; esac
+case "$EVAL_TRANSLATE_ENABLED" in 0|false|no|FALSE) ;; *) REQUIRED_GB=$((REQUIRED_GB + GB_TRANSLATE)) ;; esac
+REQUIRED_GB=$((REQUIRED_GB + GB_HEADROOM))
 FREE_GB=$(df -BG --output=avail "$(dirname "$MODEL_CACHE")" 2>/dev/null | tail -1 | tr -dc '0-9')
-if [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt 15 ]; then
-  fail "only ${FREE_GB} GB free for the model cache at $MODEL_CACHE; about 15 GB is needed. Set S2ST_MODEL_CACHE to a bigger disk."
+if [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt "$REQUIRED_GB" ]; then
+  fail "only ${FREE_GB} GB free for the model cache at $MODEL_CACHE; about ${REQUIRED_GB} GB is needed (SER: $EVAL_SER_ENABLED, translation: $EVAL_TRANSLATE_ENABLED). Set S2ST_MODEL_CACHE to a bigger disk, or turn EVAL_SER_ENABLED / EVAL_TRANSLATE_ENABLED off."
 fi
 
 # ---------- 2. shell defaults for new terminals ----------
@@ -314,12 +325,23 @@ from huggingface_hub import snapshot_download
 MODELS = [
     ("mobiuslabsgmbh/faster-whisper-large-v3-turbo", None),
     ("Unbabel/wmt22-cometkiwi-da", None),
-    ("microsoft/infoxlm-large", None),
     ("google/metricx-24-hybrid-large-v2p6-bfloat16", None),
     ("google/mt5-xl", ["*.json", "*.model"]),   # MetricX only needs the tokenizer
     ("sentence-transformers/LaBSE", None),
     ("tabularisai/multilingual-sentiment-analysis", None),
 ]
+
+def _on(name, default="1"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+# Speech Emotion Recognition (EVAL_SER_ENABLED).
+if _on("EVAL_SER_ENABLED"):
+    MODELS.append(("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", None))
+
+# Translation (EVAL_TRANSLATE_ENABLED).
+if _on("EVAL_TRANSLATE_ENABLED"):
+    MODELS.append(("facebook/nllb-200-distilled-600M", None))
+    MODELS.append(("facebook/hf-seamless-m4t-medium", None))
 
 # Weight formats this project never loads.
 SKIP = ["*.h5", "*.msgpack", "*.onnx", "onnx/*", "*.ot", "rust_model*", "openvino/*", "*.tflite"]

@@ -58,6 +58,7 @@ target-language tokenizer coverage.
 | `API/API_GUIDE.md` | **Programmatic guide** - every endpoint, request/response contracts, errors, retries, idempotency, score interpretation, performance, and the folder -> cron -> API pipeline. |
 | `API/ROADMAP.md` | What was built in 2.0, and what is still open. |
 | `API/cron/` | The automation pipeline: batch runner, cron installer, and a mock API for offline testing. |
+| `docs/obsidian/` | Obsidian-ready notes: the full architecture with Mermaid diagrams, and a per-model reference. |
 
 ## Programmatic API and the automation pipeline
 
@@ -100,6 +101,15 @@ curl -s -X POST http://localhost:8000/jobs \
 
 The dashboard (port 8501) reads the same store and can start evaluations itself from
 its **New evaluation** tab.
+
+### Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [`docs/obsidian/CompNova Evaluation API - Architecture.md`](docs/obsidian/CompNova%20Evaluation%20API%20-%20Architecture.md) | The full architecture, with Mermaid diagrams of the system, the pipeline, the job lifecycle and the storage model. Obsidian-flavoured (frontmatter, callouts, wikilinks). |
+| [`docs/obsidian/CompNova Model Reference.md`](docs/obsidian/CompNova%20Model%20Reference.md) | Every checkpoint: what it does, where it is used, how big it is, and the caveats. |
+| [`API/API_GUIDE.md`](API/API_GUIDE.md) | The programmatic contract — every endpoint, request and response schemas, errors, retries, idempotency. |
+| [`API/ROADMAP.md`](API/ROADMAP.md) | What is done and what is still open. |
 
 ## Affective tone (SER)
 

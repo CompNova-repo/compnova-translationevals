@@ -7,20 +7,22 @@ Model loaders use functools.lru_cache instead of st.cache_resource,
 since this module has no Streamlit dependency - it can be imported by
 a plain script, a FastAPI app, or a Streamlit app equally.
 
-Changes in 2.0 (see API/ROADMAP.md)
+Changes in 2.1 (see API/ROADMAP.md)
 -----------------------------------
 * ``warm_up()`` no longer raises. It reports per-model status instead, so a
   single failed download cannot stop the service from starting.
+* Speech Emotion Recognition (SER) via ``wav2vec2-lg-xlsr-en-speech-emotion-recognition``
+  is now integrated into the evaluation pipeline, returning ``ser_match_score``
+  (cosine similarity over the 8-class emotion distribution), ``source_emotion_top1``,
+  and ``target_emotion_top1`` both at top level and inside ``summary``.
+* ``validate_and_normalize_audio()`` verifies audio file integrity, sample rate,
+  channel count, and duration, rejecting corrupted files and automatically
+  resampling non-16kHz or multi-channel audio to 16 kHz mono WAV.
 * MetricX-24 runs with request-unique file names and is serialised by a
   lock, so two concurrent evaluations can no longer overwrite each other's
   input/output files.
 * ``evaluate_pairs_batch()`` evaluates many pairs with ONE MetricX model
-  load instead of one per pair. MetricX-24 is executed as a subprocess that
-  has to load its model every time, which used to dominate the cost of a
-  batch. This is what makes a folder of files affordable.
-* Translation (Whisper -> NLLB -> TTS, and direct SeamlessM4T) moved here
-  from the Streamlit playground, so the API can serve the whole pipeline.
-* Every stage records its duration, so throughput can be reasoned about.
+  load instead of one per pair.
 """
 import os
 
@@ -30,11 +32,13 @@ os.environ["USE_JAX"] = "NO"
 import functools
 import json
 import logging
+import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import wave
 
 import numpy as np
 import torch
@@ -43,6 +47,7 @@ import config
 
 LOG = logging.getLogger("compnova.eval.core")
 
+SER_MODEL_NAME = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
 SER_LABELS = [
     "angry", "calm", "disgust", "fearful",
     "happy", "neutral", "sad", "surprised",
@@ -98,13 +103,7 @@ def _record(name: str, ok: bool, seconds: float, error: str | None = None) -> No
 
 
 def _ensure_metricx_repo() -> None:
-    """Make sure the pinned MetricX checkout is available.
-
-    The Docker image clones it at build time and the RunPod script links it
-    in, so this is normally a no-op. If it is missing we clone it once, but
-    we never raise from here - a missing MetricX is reported by
-    /health/ready and surfaces as a clean error on the first evaluation.
-    """
+    """Make sure the pinned MetricX checkout is available."""
     target = config.METRICX_PATH
     if os.path.exists(os.path.join(target, "metricx24", "predict.py")):
         return
@@ -119,6 +118,216 @@ def _ensure_metricx_repo() -> None:
         )
     except Exception as exc:  # pragma: no cover - depends on the environment
         LOG.error("could not obtain MetricX at %s: %s", target, exc)
+
+
+# --------------------------------------------------------------------------- #
+# audio inspection, validation & 16 kHz mono normalization
+# --------------------------------------------------------------------------- #
+
+def inspect_audio_file(path: str) -> dict:
+    """Inspect an audio file and return its metadata (`sample_rate`, `channels`, `frames`, `duration_s`).
+
+    Raises ValueError if the file is corrupted, unreadable, or has zero duration.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise ValueError("audio file is missing or empty")
+
+    # 1. Try soundfile first (fast, supports WAV/FLAC/OGG)
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.samplerate and info.samplerate > 0 and info.frames > 0 and info.channels > 0:
+            return {
+                "sample_rate": int(info.samplerate),
+                "channels": int(info.channels),
+                "frames": int(info.frames),
+                "duration_s": float(info.frames) / float(info.samplerate),
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # 2. Try standard library wave module for WAV files
+    try:
+        with wave.open(path, "rb") as wf:
+            sr = wf.getframerate()
+            ch = wf.getnchannels()
+            frames = wf.getnframes()
+            if sr > 0 and ch > 0 and frames > 0:
+                return {
+                    "sample_rate": int(sr),
+                    "channels": int(ch),
+                    "frames": int(frames),
+                    "duration_s": float(frames) / float(sr),
+                }
+    except Exception:
+        pass
+
+    # 3. Try ffprobe for compressed containers (MP3, M4A, OPUS, AAC, WMA)
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,channels,duration:format=duration",
+                "-of", "json",
+                path,
+            ],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(out.stdout or "{}")
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
+        if streams:
+            s = streams[0]
+            sr = int(s.get("sample_rate") or 0)
+            ch = int(s.get("channels") or 0)
+            dur = float(s.get("duration") or fmt.get("duration") or 0.0)
+            if sr > 0 and ch > 0 and dur > 0:
+                return {
+                    "sample_rate": sr,
+                    "channels": ch,
+                    "frames": int(round(sr * dur)),
+                    "duration_s": dur,
+                }
+    except Exception:
+        pass
+
+    raise ValueError(f"corrupted or unreadable audio file: {os.path.basename(path)!r}")
+
+
+def _resample_wav_stdlib(src_path: str, dst_path: str, target_sr: int = 16000,
+                         target_channels: int = 1) -> bool:
+    """Pure-Python standard-library fallback to convert PCM WAV to 16 kHz mono."""
+    try:
+        with wave.open(src_path, "rb") as r:
+            sr = r.getframerate()
+            ch = r.getnchannels()
+            sw = r.getsampwidth()
+            frames = r.readframes(r.getnFrames() if hasattr(r, "getnFrames") else r.getnframes())
+        if sw != 2 or not frames:
+            return False
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+        if ch > 1:
+            samples = samples.reshape(-1, ch).mean(axis=1)
+        if sr != target_sr and len(samples) > 1:
+            duration = len(samples) / float(sr)
+            new_len = max(1, int(round(duration * target_sr)))
+            x_old = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
+            x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+            samples = np.interp(x_new, x_old, samples)
+        pcm = np.clip(np.round(samples), -32768, 32767).astype(np.int16).tobytes()
+        with wave.open(dst_path, "wb") as w:
+            w.setnchannels(target_channels)
+            w.setsampwidth(2)
+            w.setframerate(target_sr)
+            w.writeframes(pcm)
+        return True
+    except Exception:
+        return False
+
+
+def validate_and_normalize_audio(
+    path: str,
+    label: str = "audio",
+    target_sr: int | None = None,
+    target_channels: int | None = None,
+    auto_resample: bool | None = None,
+) -> dict:
+    """Validate audio integrity, sample rate, channel count, and duration.
+
+    When `auto_resample` is True and the audio does not match `target_sr` Hz or
+    `target_channels` channels, resamples the file in-place (or to a normalized
+    WAV in the same directory) so downstream models receive raw 16 kHz mono
+    waveforms.
+    """
+    target_sr = target_sr or config.EXPECTED_SAMPLE_RATE
+    target_channels = target_channels or config.EXPECTED_CHANNELS
+    if auto_resample is None:
+        auto_resample = config.AUTO_RESAMPLE_16K
+
+    info = inspect_audio_file(path)
+    sr = info["sample_rate"]
+    channels = info["channels"]
+    duration_s = info["duration_s"]
+
+    if duration_s <= 0:
+        raise ValueError(f"{label!r} has zero duration")
+
+    needs_conversion = (sr != target_sr) or (channels != target_channels)
+    if not needs_conversion:
+        return {
+            "path": path,
+            "sample_rate": sr,
+            "channels": channels,
+            "duration_s": duration_s,
+            "resampled": False,
+        }
+
+    if not auto_resample:
+        raise ValueError(
+            f"{label!r} must be {target_sr} Hz and {target_channels} channel(s), "
+            f"got {sr} Hz and {channels} channel(s)"
+        )
+
+    base_dir = os.path.dirname(os.path.abspath(path))
+    norm_path = os.path.join(base_dir, f"norm16k_{uuid.uuid4().hex[:12]}.wav")
+    converted = False
+
+    # 1. Try ffmpeg first
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", path,
+                "-ar", str(target_sr), "-ac", str(target_channels),
+                "-c:a", "pcm_s16le", norm_path,
+            ],
+            check=True, capture_output=True, timeout=120,
+        )
+        converted = os.path.exists(norm_path) and os.path.getsize(norm_path) > 44
+    except Exception:
+        converted = False
+
+    # 2. Fallback to pure-Python stdlib/numpy resampling for PCM WAV files
+    if not converted:
+        converted = _resample_wav_stdlib(path, norm_path, target_sr, target_channels)
+
+    # 3. Fallback to librosa + soundfile if installed
+    if not converted:
+        try:
+            import librosa
+            import soundfile as sf
+            y, _ = librosa.load(path, sr=target_sr, mono=(target_channels == 1))
+            sf.write(norm_path, y, target_sr, subtype="PCM_16")
+            converted = os.path.exists(norm_path) and os.path.getsize(norm_path) > 44
+        except Exception:
+            converted = False
+
+    if converted:
+        try:
+            os.replace(norm_path, path)
+            norm_info = inspect_audio_file(path)
+            return {
+                "path": path,
+                "sample_rate": norm_info["sample_rate"],
+                "channels": norm_info["channels"],
+                "duration_s": norm_info["duration_s"],
+                "resampled": True,
+                "original_sample_rate": sr,
+                "original_channels": channels,
+            }
+        except Exception:
+            if os.path.exists(norm_path):
+                try:
+                    os.remove(norm_path)
+                except OSError:
+                    pass
+
+    raise ValueError(
+        f"{label!r} has sample_rate={sr} Hz, channels={channels} and could not be "
+        f"resampled to {target_sr} Hz mono"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +365,58 @@ def get_sentiment_pipeline():
 
 
 @functools.lru_cache(maxsize=1)
+def get_ser_pipeline():
+    """Load the wav2vec2 Speech Emotion Recognition (SER) model with rebuilt head."""
+    import torch.nn as nn
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from transformers import AutoFeatureExtractor, Wav2Vec2Model
+
+    feature_extractor = AutoFeatureExtractor.from_pretrained(SER_MODEL_NAME)
+    backbone = Wav2Vec2Model.from_pretrained(SER_MODEL_NAME)
+    cfg = backbone.config
+    dropout_p = getattr(cfg, "final_dropout", 0.1)
+    hidden_size = cfg.hidden_size
+
+    classifier = nn.Sequential(
+        nn.Linear(hidden_size, hidden_size),
+        nn.Tanh(),
+        nn.Dropout(dropout_p),
+        nn.Linear(hidden_size, len(SER_LABELS)),
+    )
+
+    class _SERModel(nn.Module):
+        def __init__(self, bb, clf):
+            super().__init__()
+            self.backbone = bb
+            self.classifier = clf
+
+        def forward(self, input_values, attention_mask=None):
+            outputs = self.backbone(input_values, attention_mask=attention_mask)
+            pooled = outputs.last_hidden_state.mean(dim=1)
+            return self.classifier(pooled)
+
+    model = _SERModel(backbone, classifier)
+    weights_path = hf_hub_download(repo_id=SER_MODEL_NAME, filename="model.safetensors")
+    state = load_file(weights_path)
+    head_weights = {}
+    for k, v in state.items():
+        if not k.startswith("classifier."):
+            continue
+        suffix = k[len("classifier."):]
+        if suffix.startswith("dense."):
+            head_weights["0." + suffix[len("dense."):]] = v
+        elif suffix.startswith("output."):
+            head_weights["3." + suffix[len("output."):]] = v
+    classifier.load_state_dict(head_weights, strict=False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    model.eval()
+    id2label = {i: lbl for i, lbl in enumerate(SER_LABELS)}
+    return feature_extractor, model, id2label
+
+
+@functools.lru_cache(maxsize=1)
 def get_nllb():
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     model_name = "facebook/nllb-200-distilled-600M"
@@ -187,15 +448,10 @@ _LOADERS = (
 
 
 def warm_up(include_translation: bool | None = None) -> dict:
-    """Load the models once and report what happened.
-
-    Unlike the previous version this NEVER raises: one model that fails to
-    download must not stop the service from starting, because then there is
-    no /health to report the failure with. Each model is recorded in
-    MODEL_STATUS and surfaced by /health/ready.
-    """
-    started = time.perf_counter()
+    """Load the models once and report what happened."""
     loaders = list(_LOADERS)
+    if config.SER_ENABLED:
+        loaders.append(("ser", get_ser_pipeline))
     if include_translation is None:
         include_translation = config.TRANSLATE_ENABLED
     if include_translation:
@@ -237,6 +493,76 @@ def model_status() -> dict:
 
 def models_ready() -> bool:
     return model_status()["ready"]
+
+
+# --------------------------------------------------------------------------- #
+# Speech Emotion Recognition (SER) helpers
+# --------------------------------------------------------------------------- #
+
+def do_audio_emotion(audio_path: str) -> list[dict]:
+    """Load audio at 16 kHz mono and return sorted 8-class SER predictions."""
+    import librosa
+
+    feature_extractor, model, id2label = get_ser_pipeline()
+    waveform, _ = librosa.load(audio_path, sr=16000, mono=True)
+    inputs = feature_extractor(waveform, sampling_rate=16000, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        logits = model(**inputs)
+    probs = torch.nn.functional.softmax(logits, dim=-1)[0].detach().cpu()
+    preds = [
+        {"label": id2label[i], "score": round(float(p), 4)}
+        for i, p in enumerate(probs)
+    ]
+    return sorted(preds, key=lambda x: x["score"], reverse=True)
+
+
+def compute_affective_match_score(src_preds: list[dict], mt_preds: list[dict]) -> float:
+    """Cosine similarity over the canonical 8-class SER label set."""
+    if not src_preds or not mt_preds:
+        return 0.0
+    src_map = {p["label"]: float(p["score"]) for p in src_preds}
+    mt_map = {p["label"]: float(p["score"]) for p in mt_preds}
+    p = np.array([src_map.get(lbl, 0.0) for lbl in SER_LABELS])
+    q = np.array([mt_map.get(lbl, 0.0) for lbl in SER_LABELS])
+    p_norm = float(np.linalg.norm(p))
+    q_norm = float(np.linalg.norm(q))
+    if p_norm == 0.0 or q_norm == 0.0:
+        return 0.0
+    return round(float(np.dot(p, q) / (p_norm * q_norm)), 4)
+
+
+def evaluate_ser_pair(src_path: str, mt_path: str) -> dict:
+    """Run Speech Emotion Recognition on a source/target audio pair."""
+    if not config.SER_ENABLED:
+        return {
+            "ser_match_score": None,
+            "source_emotion_top1": None,
+            "target_emotion_top1": None,
+            "source_distribution": [],
+            "target_distribution": [],
+        }
+    try:
+        src_preds = do_audio_emotion(src_path)
+        mt_preds = do_audio_emotion(mt_path)
+        score = compute_affective_match_score(src_preds, mt_preds)
+        return {
+            "ser_match_score": score,
+            "source_emotion_top1": src_preds[0]["label"] if src_preds else None,
+            "target_emotion_top1": mt_preds[0]["label"] if mt_preds else None,
+            "source_distribution": src_preds,
+            "target_distribution": mt_preds,
+        }
+    except Exception as exc:
+        LOG.warning("SER evaluation skipped/failed for (%s, %s): %s", src_path, mt_path, exc)
+        return {
+            "ser_match_score": None,
+            "source_emotion_top1": None,
+            "target_emotion_top1": None,
+            "source_distribution": [],
+            "target_distribution": [],
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -361,16 +687,7 @@ def cometeval_batch(pairs):
 
 
 def metricx_eval_batch(pairs):
-    """Score pairs with MetricX-24 QE.
-
-    Runs as a subprocess (upstream research code with no library entry
-    point). Two consequences are handled explicitly here:
-
-    * the input/output file names are unique per call, so two concurrent
-      evaluations cannot overwrite each other's files;
-    * the whole call is serialised by a lock, because the subprocess loads a
-      multi-gigabyte model and must not run twice at once.
-    """
+    """Score pairs with MetricX-24 QE."""
     if not pairs:
         return []
 
@@ -406,7 +723,7 @@ def metricx_eval_batch(pairs):
     try:
         with _metricx_lock:
             LOG.info("metricx: scoring %d chunk(s)", len(pairs))
-            completed = subprocess.run(
+            subprocess.run(
                 command,
                 check=True,
                 capture_output=True,
@@ -446,7 +763,8 @@ def sentiment_batch(texts):
 # --------------------------------------------------------------------------- #
 
 def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
-              src_sent, mt_sent, src_text, mt_text, timings) -> dict:
+              src_sent, mt_sent, src_text, mt_text, timings, ser_info=None) -> dict:
+    ser_info = ser_info or {}
     chunks = []
     sentiment_matches = []
     for idx, p in enumerate(pairs):
@@ -471,8 +789,16 @@ def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
         round(100 * sum(sentiment_matches) / len(sentiment_matches), 1)
         if sentiment_matches else None
     )
+    ser_match_score = ser_info.get("ser_match_score")
+    src_emotion_top1 = ser_info.get("source_emotion_top1")
+    tgt_emotion_top1 = ser_info.get("target_emotion_top1")
 
     return {
+        "comet_score": avg_comet,
+        "metricx_score": avg_metricx,
+        "ser_match_score": ser_match_score,
+        "source_emotion_top1": src_emotion_top1,
+        "target_emotion_top1": tgt_emotion_top1,
         "transcripts": {"source": src_text, "target": mt_text},
         "summary": {
             "chunks": len(pairs),
@@ -480,7 +806,11 @@ def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
             "comet_kiwi": avg_comet,
             "metricx_24": avg_metricx,
             "sentiment_agreement_pct": sentiment_agreement_pct,
+            "ser_match_score": ser_match_score,
+            "source_emotion_top1": src_emotion_top1,
+            "target_emotion_top1": tgt_emotion_top1,
         },
+        "ser": ser_info,
         "chunks": chunks,
         "unmatched": {"source": unmatched_src, "target": unmatched_mt},
         "timings": timings,
@@ -488,23 +818,14 @@ def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
 
 
 def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2) -> list[dict]:
-    """Evaluate many audio pairs, sharing the expensive stages.
-
-    ``items`` is a list of ``{"source_path": str, "target_path": str}``.
-    Returns one result dict per item, in the same order.
-
-    Why this exists: MetricX-24 is executed as a subprocess that loads its
-    model on every call. Scoring N pairs in one call turns N model loads
-    into one. For a folder of 50 files that is the difference between
-    roughly an hour of pure overhead and roughly a minute.
-    """
+    """Evaluate many audio pairs, sharing the expensive stages."""
     if not items:
         return []
 
     timings = {"total_s": 0.0}
     t_start = time.perf_counter()
 
-    # ---- 1. transcribe and align ------------------------------------- #
+    # ---- 1. transcribe, align, and run SER --------------------------- #
     t0 = time.perf_counter()
     prepared = []
     for item in items:
@@ -514,12 +835,14 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             src_segments, mt_segments,
             min_similarity=min_similarity, max_merge=max_merge,
         )
+        ser_info = evaluate_ser_pair(item["source_path"], item["target_path"])
         prepared.append({
             "pairs": pairs,
             "unmatched_src": unmatched_src,
             "unmatched_mt": unmatched_mt,
             "src_text": join_segment_text(src_segments),
             "mt_text": join_segment_text(mt_segments),
+            "ser_info": ser_info,
         })
     timings["transcribe_align_s"] = round(time.perf_counter() - t0, 2)
 
@@ -555,6 +878,7 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             entry["src_text"],
             entry["mt_text"],
             timings,
+            ser_info=entry["ser_info"],
         ))
         offset += count
 
@@ -613,12 +937,7 @@ def synthesize_speech(text: str, target_lang: str) -> str:
 
 
 def _to_wav_16k(src_path: str) -> str:
-    """Best-effort conversion to 16 kHz mono WAV using ffmpeg.
-
-    Whisper resamples internally, so this is not strictly required - it just
-    makes the synthesised audio behave like a normal input file and keeps
-    the container format predictable.
-    """
+    """Best-effort conversion to 16 kHz mono WAV using ffmpeg."""
     out = f"/tmp/compnova_tts_{uuid.uuid4().hex[:12]}.wav"
     try:
         subprocess.run(
@@ -637,16 +956,9 @@ def _to_wav_16k(src_path: str) -> str:
 
 
 def translate_audio(source_path: str, target_lang: str, mode: str = "cascaded") -> dict:
-    """Translate one audio file.
-
-    mode="cascaded": Whisper -> NLLB-200 -> gTTS (transparent, word-level)
-    mode="seamless":  SeamlessM4T, one shot from waveform to waveform
-
-    Returns {"audio_path", "text", "mode", "target_lang"}.
-    """
+    """Translate one audio file."""
     target = normalise_language(target_lang)
     if target == "eng":
-        # Nothing to do - but we still need a transcript for the caller.
         segments = transcribe_segments(source_path)
         return {
             "audio_path": source_path,

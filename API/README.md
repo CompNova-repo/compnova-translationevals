@@ -16,6 +16,9 @@ Dockerfile.cpu  CPU image (python:3.10-slim)
 constraints.txt The versions that are known to work together - one source of truth
 runpod_start.sh One-shot setup + start on a RunPod pod, and the cron installer
 verify_setup.sh End-to-end check of the whole system (run it on the pod)
+testkit.py     Shared test scaffolding: stubs torch and the model loaders
+test_api.py    Offline suite - the whole HTTP surface, no GPU, no models
+test_server.py Boots a real Uvicorn server and drives it over HTTP
 test_api.py     Offline test harness - 56 checks, no GPU needed
 requirements-api.txt
 ```
@@ -54,16 +57,30 @@ curl -s -X POST http://localhost:8000/jobs \
 
 Interactive docs: `http://<host>:8000/docs`.
 
+## Architecture notes
+
+Two Obsidian-ready notes live in [`../docs/obsidian/`](../docs/obsidian/):
+
+- **CompNova Evaluation API - Architecture** — the system, the evaluation pipeline, the
+  job lifecycle and the storage model, each with a Mermaid diagram.
+- **CompNova Model Reference** — every checkpoint, its role, its size and its caveats.
+
 ## Testing it
 
 ```bash
-# offline: no GPU, no models, no network - 56 checks over the whole HTTP surface
+# offline: no GPU, no models, no network
 pip install fastapi httpx numpy python-multipart
-python3 API/test_api.py
 
-# on the pod: the real thing, end to end
+python3 API/test_api.py        # 106 checks - the whole HTTP surface
+python3 API/test_server.py     # 19 checks - boots a real Uvicorn server
+python3 API/cron/test_runner.py # 25 checks - the pipeline, against a mock API
+
+# on the pod: the real thing, end to end, with the real models
 bash API/verify_setup.sh
 ```
+
+All three offline suites stub `torch` and every model loader, so nothing is
+downloaded and no GPU is needed.
 
 ## Four things to know before you build on this
 
