@@ -1,0 +1,12 @@
+streamlit
+requests
+pandas
+transformers
+torch
+huggingface_hub
+sentencepiece
+scipy
+librosa
+soundfile
+gTTS
+plotly

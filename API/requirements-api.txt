@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+faster-whisper
+unbabel-comet
+transformers
+torch
+huggingface_hub
+sentencepiece
+scipy
+librosa
+soundfile
+sentence-transformers
