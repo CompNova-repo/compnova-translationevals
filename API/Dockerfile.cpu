@@ -3,7 +3,9 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
     USE_TF=NO \
-    USE_JAX=NO
+    USE_JAX=NO \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/var/lib/compnova/hf-cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ffmpeg curl \
@@ -18,23 +20,15 @@ RUN pip install --no-cache-dir "cython<3.0.0"
 # using --index-url alone restricts pip to ONLY that index for every
 # package including transitive deps like typing-extensions, which fails
 # when that index lacks a build dependency (flit_core) PyPI would have had.
-RUN pip install --no-cache-dir torch --extra-index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Step 3: COMET, pinned and isolated with --no-deps.
 RUN pip install --no-cache-dir "unbabel-comet==2.2.7" --no-deps
 RUN pip install --no-cache-dir entmax "jsonargparse==3.13.1" pytorch-lightning sacrebleu torchmetrics
 
-# Step 4: force the exact versions COMET needs - LAST thing that touches
-# these six packages before the app runs.
-RUN pip install --no-cache-dir \
-    "numpy==1.26.4" "protobuf==4.25.9" "huggingface_hub==0.36.2" \
-    "tokenizers==0.15.2" "transformers==4.39.3" "torchmetrics==0.10.3" \
-    "accelerate==0.27.2" \
-    --force-reinstall --no-deps
-
-# Step 5: app requirements, still --no-deps throughout.
-COPY requirements-api.txt .
-RUN pip install --no-cache-dir -r requirements-api.txt --no-deps
+# Step 4: app requirements, still --no-deps throughout.
+COPY requirements-api.txt constraints.txt ./
+RUN pip install --no-cache-dir -r requirements-api.txt -c constraints.txt --no-deps
 RUN pip install --no-cache-dir av ctranslate2 onnxruntime sentence-transformers safetensors --no-deps
 
 # FastAPI/Starlette/Uvicorn/Pydantic/huggingface_hub's own required
@@ -47,7 +41,22 @@ RUN pip install --no-cache-dir click h11 starlette anyio sniffio idna \
     pydantic pydantic-core annotated_doc annotated-types requests \
     pytz python-dateutil
 
-# Step 6: remove optional packages that transformers.Trainer probes for
+# `datasets` (imported by metricx24.predict) and `gTTS` (used by
+# POST /translate). datasets is installed with --no-deps so it cannot drag
+# huggingface_hub forward.
+RUN pip install --no-cache-dir datasets --no-deps \
+    && pip install --no-cache-dir pyarrow dill xxhash multiprocess fsspec tqdm pandas \
+    && pip install --no-cache-dir gTTS beautifulsoup4
+
+# Force the exact versions COMET needs - LAST thing that touches these
+# six packages before the app runs.
+RUN pip install --no-cache-dir \
+    "numpy==1.26.4" "protobuf==4.25.9" "huggingface_hub==0.36.2" \
+    "tokenizers==0.15.2" "transformers==4.39.3" "torchmetrics==0.10.3" \
+    "accelerate==0.27.2" \
+    --force-reinstall --no-deps
+
+# Remove optional packages that transformers.Trainer probes for
 # and crashes on with this pin - none needed for inference. jax/peft/
 # wandb all confirmed necessary removals through today's debugging;
 # tensorflow removed preemptively for the same reason.
@@ -57,10 +66,26 @@ RUN pip uninstall -y jax jaxlib peft tensorflow tensorflow-cpu keras wandb 2>/de
 RUN git clone https://github.com/google-research/metricx.git /app/metricx \
     && git -C /app/metricx checkout fc4978eb064670f7cc33e93ea4f52d38396b8ae6
 
-COPY eval_core.py api.py ./
+# The application. eval_store.py, config.py and errors.py MUST be copied -
+# api.py imports all three at module level and the container dies at
+# startup without them.
+COPY eval_core.py eval_store.py config.py errors.py api.py ./
+COPY cron/ ./cron/
+
+RUN mkdir -p /var/lib/compnova/hf-cache /var/lib/compnova/spool
+VOLUME ["/var/lib/compnova"]
+
+ENV EVAL_DB_PATH=/var/lib/compnova/evaluations.db \
+    EVAL_SPOOL_DIR=/var/lib/compnova/spool \
+    METRICX_DIR=/app/metricx
 
 EXPOSE 8000
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
 # Pass your Hugging Face token at run time:
 #   docker run -p 8000:8000 -e HF_TOKEN=hf_your_token compnova-eval-api-cpu
+#
+# Set EVAL_API_KEYS to require an X-API-Key header.
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

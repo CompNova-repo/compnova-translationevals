@@ -25,26 +25,56 @@ st.set_page_config(page_title="S2ST evaluation monitor", layout="wide")
 
 # ---------- helpers ----------
 
-def api_get(base_url, path, **params):
-    resp = requests.get(f"{base_url}{path}", params=params, timeout=15)
+def auth_headers(api_key):
+    """The API accepts an X-API-Key header when it is configured with keys."""
+    return {"X-API-Key": api_key} if api_key else {}
+
+
+def api_get(base_url, path, api_key="", **params):
+    resp = requests.get(
+        f"{base_url}{path}", params=params, timeout=15, headers=auth_headers(api_key)
+    )
     resp.raise_for_status()
     return resp.json()
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def cached_health(base_url):
-    return api_get(base_url, "/health")
+def api_post(base_url, path, files=None, data=None, params=None, api_key="",
+             timeout=1800):
+    """POST with the API's error envelope turned into a readable exception."""
+    resp = requests.post(
+        f"{base_url}{path}",
+        files=files,
+        data=data,
+        params=params,
+        timeout=(15, timeout),
+        headers=auth_headers(api_key),
+    )
+    if not resp.ok:
+        try:
+            detail = resp.json().get("error", {})
+            raise RuntimeError(
+                f"{detail.get('code', 'HTTP ' + str(resp.status_code))}: "
+                f"{detail.get('message', resp.text[:300])}"
+            )
+        except ValueError:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    return resp.json()
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_list(base_url, limit):
-    return api_get(base_url, "/evaluations", limit=limit)
+def cached_health(base_url, api_key=""):
+    return api_get(base_url, "/health", api_key)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_list(base_url, limit, api_key=""):
+    return api_get(base_url, "/evaluations", api_key, limit=limit)
 
 
 @st.cache_data(max_entries=50, show_spinner=False)
-def cached_record(base_url, eval_id):
+def cached_record(base_url, eval_id, api_key=""):
     """A stored evaluation never changes, so it is cached until the app restarts."""
-    return api_get(base_url, f"/evaluations/{eval_id}")
+    return api_get(base_url, f"/evaluations/{eval_id}", api_key)
 
 
 def fmt_time(ts):
@@ -289,6 +319,12 @@ def render_unmatched(unmatched):
 with st.sidebar:
     st.header("Settings")
     api_url = st.text_input("Evaluation API URL", DEFAULT_API_URL).rstrip("/")
+    api_key = st.text_input(
+        "API key (X-API-Key)",
+        os.environ.get("EVAL_API_KEY", ""),
+        type="password",
+        help="Only needed when the service was started with EVAL_API_KEYS set.",
+    )
     follow_latest = st.toggle("Always show the latest evaluation", value=True)
     limit = st.slider("Evaluations to list", 5, 50, 20)
     if st.button("Refresh"):
@@ -296,46 +332,195 @@ with st.sidebar:
         cached_list.clear()
 
 st.title("S2ST evaluation monitor")
-st.caption("Results from the evaluation API. Send audio pairs to POST /evaluate to add more.")
-
-try:
-    cached_health(api_url)
-except requests.RequestException as e:
-    st.error(f"Can't reach the API at {api_url}. Check that it is running and the URL is right. ({e})")
-    st.stop()
-
-try:
-    recent = cached_list(api_url, limit)
-except requests.RequestException as e:
-    st.error(f"The API is up but listing evaluations failed. Does it have the /evaluations endpoint? ({e})")
-    st.stop()
-
-if not recent:
-    st.info("No evaluations yet. Send an audio pair to POST /evaluate, then press Refresh.")
-    st.stop()
-
-if follow_latest:
-    selected = recent[0]["id"]
-else:
-    labels = {m["id"]: eval_label(m) for m in recent}
-    selected = st.selectbox("Evaluation (newest first)", list(labels), format_func=labels.get)
-
-try:
-    record = cached_record(api_url, selected)
-except requests.RequestException as e:
-    st.error(f"Couldn't load evaluation {selected}. ({e})")
-    st.stop()
-
-result = record.get("result", {})
-st.markdown(
-    f"**{record.get('source_name') or 'source'}** to **{record.get('target_name') or 'target'}**, "
-    f"evaluated {fmt_time(record.get('created_at'))} (id `{record['id']}`)"
+st.caption(
+    "Results from the evaluation API. Upload a pair in the **New evaluation** tab "
+    "to add more."
 )
 
-render_summary(result.get("summary"))
-render_chunks(result.get("chunks"))
-render_transcripts(result.get("transcripts"), record["id"])
-render_unmatched(result.get("unmatched"))
+try:
+    cached_health(api_url, api_key)
+except requests.RequestException as e:
+    st.error(
+        f"Can't reach the API at {api_url}. Check that it is running and the URL "
+        f"is right. ({e})"
+    )
+    st.stop()
 
-with st.expander("Raw JSON"):
-    st.json(record)
+tab_results, tab_new = st.tabs(["Results", "New evaluation"])
+
+
+# ---------- new evaluation ----------
+
+def _render_result(result, eval_id):
+    summary = result.get("summary", {})
+    render_summary(summary)
+    cols = st.columns(4)
+    cols[0].metric("Chunks", summary.get("chunks", 0))
+    cols[1].metric("COMET-Kiwi", summary.get("comet_kiwi"))
+    cols[2].metric("MetricX-24", summary.get("metricx_24"))
+    cols[3].metric("Sentiment match %", summary.get("sentiment_agreement_pct"))
+    render_chunks(result.get("chunks"))
+    render_transcripts(result.get("transcripts"), eval_id)
+    render_unmatched(result.get("unmatched"))
+
+
+with tab_new:
+    st.subheader("Evaluate an audio pair")
+    st.caption(
+        "Upload the source audio and its translation. Leave the translation "
+        "empty and pick a language to have the API translate it for you."
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        source_file = st.file_uploader(
+            "Source audio", type=["wav", "mp3", "flac", "m4a", "ogg"]
+        )
+    with col_b:
+        target_file = st.file_uploader(
+            "Translated audio (optional)", type=["wav", "mp3", "flac", "m4a", "ogg"]
+        )
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    with c1:
+        target_lang = st.selectbox(
+            "Translate into",
+            ["spa", "fra", "deu", "cmn", "ita", "por", "jpn", "eng"],
+            help="Used when no translated audio is uploaded.",
+        )
+    with c2:
+        min_similarity = st.slider("Min similarity", 0.0, 1.0, 0.5, 0.05)
+    with c3:
+        max_merge = st.slider("Max merge", 1, 3, 2)
+
+    params = {"min_similarity": min_similarity, "max_merge": max_merge}
+
+    b1, b2 = st.columns(2)
+    with b1:
+        evaluate_clicked = st.button(
+            "Evaluate the pair",
+            type="primary",
+            disabled=source_file is None or target_file is None,
+        )
+    with b2:
+        translate_clicked = st.button(
+            "Translate, then evaluate",
+            disabled=source_file is None or target_file is not None,
+        )
+
+    if evaluate_clicked:
+        files = {
+            "source_audio": (
+                source_file.name, source_file.getvalue(), "application/octet-stream"
+            ),
+            "target_audio": (
+                target_file.name, target_file.getvalue(), "application/octet-stream"
+            ),
+        }
+        with st.spinner("Evaluating - this takes a few minutes per pair..."):
+            try:
+                result = api_post(
+                    api_url, "/evaluate", files=files, params=params, api_key=api_key
+                )
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+            else:
+                st.success(f"Done - evaluation `{result.get('id')}`")
+                _render_result(result, result.get("id", "new"))
+                cached_list.clear()
+                cached_record.clear()
+
+    if translate_clicked:
+        files = {
+            "source_audio": (
+                source_file.name, source_file.getvalue(), "application/octet-stream"
+            ),
+        }
+        data = {"target_lang": target_lang}
+        with st.spinner("Submitting - the API translates and then evaluates..."):
+            try:
+                job = api_post(
+                    api_url, "/jobs", files=files, data=data, params=params,
+                    api_key=api_key,
+                )
+            except Exception as e:
+                st.error(f"Could not submit the job: {e}")
+            else:
+                job_id = job.get("job_id")
+                st.info(f"Job `{job_id}` queued.")
+                with st.spinner("Waiting for the result..."):
+                    import time
+
+                    final = None
+                    for _ in range(720):  # up to an hour
+                        time.sleep(5)
+                        try:
+                            record = api_get(
+                                api_url, f"/jobs/{job_id}", api_key
+                            )
+                        except requests.RequestException:
+                            continue
+                        status = record.get("status")
+                        if status == "done":
+                            final = record.get("result") or {}
+                            break
+                        if status in ("failed", "cancelled"):
+                            st.error(
+                                f"The job {status}: "
+                                f"{(record.get('error') or {}).get('message', '')}"
+                            )
+                            break
+                if final:
+                    st.success(f"Done - evaluation `{final.get('id')}`")
+                    _render_result(final, final.get("id", job_id))
+                    cached_list.clear()
+                    cached_record.clear()
+
+
+# ---------- results ----------
+
+with tab_results:
+    try:
+        listed = cached_list(api_url, limit, api_key)
+    except requests.RequestException as e:
+        st.error(
+            f"The API is up but listing evaluations failed. Does it have the "
+            f"/evaluations endpoint? ({e})"
+        )
+        st.stop()
+
+    items = listed.get("items", listed) if isinstance(listed, dict) else listed
+    if not items:
+        st.info(
+            "No evaluations yet. Upload a pair in the 'New evaluation' tab, "
+            "then press Refresh."
+        )
+    else:
+        if follow_latest:
+            selected = items[0]["id"]
+        else:
+            labels = {m["id"]: eval_label(m) for m in items}
+            selected = st.selectbox(
+                "Evaluation (newest first)", list(labels), format_func=labels.get
+            )
+
+        try:
+            record = cached_record(api_url, selected, api_key)
+        except requests.RequestException as e:
+            st.error(f"Couldn't load evaluation {selected}. ({e})")
+            st.stop()
+
+        result = record.get("result", {})
+        st.markdown(
+            f"**{record.get('source_name') or 'source'}** to "
+            f"**{record.get('target_name') or 'target'}**, "
+            f"evaluated {fmt_time(record.get('created_at'))} (id `{record['id']}`)"
+        )
+
+        render_summary(result.get("summary"))
+        render_chunks(result.get("chunks"))
+        render_transcripts(result.get("transcripts"), record["id"])
+        render_unmatched(result.get("unmatched"))
+
+        with st.expander("Raw JSON"):
+            st.json(record)

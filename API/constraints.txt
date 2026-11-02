@@ -1,0 +1,19 @@
+# Version pins for the evaluation stack.
+#
+# These are the versions that are known to work together. unbabel-comet and
+# sentence-transformers in particular declare requirements that conflict with
+# these pins even though they run fine against them - so they are installed
+# with --no-deps (see the Dockerfile and runpod_start.sh).
+#
+# One source of truth: the Dockerfile, runpod_start.sh and requirements-api.txt
+# all read this file.
+numpy==1.26.4
+transformers==4.39.3
+tokenizers==0.15.2
+protobuf==4.25.9
+accelerate==0.27.2
+huggingface_hub==0.36.2
+torchmetrics==0.10.3
+torch==2.8.0
+unbabel-comet==2.2.7
+sentence-transformers==5.7.0

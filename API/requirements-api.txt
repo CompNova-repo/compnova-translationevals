@@ -1,14 +1,45 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pandas
-faster-whisper
-unbabel-comet
-transformers
-torch
-huggingface_hub
-sentencepiece
-scipy
-librosa
-soundfile
-sentence-transformers
+# Runtime dependencies for the evaluation service.
+#
+# Pinned against constraints.txt, which holds the versions that are known to
+# work together. Install with:
+#
+#     pip install -r requirements-api.txt -c constraints.txt
+#
+# Note: unbabel-comet and sentence-transformers are installed with --no-deps
+# (see the Dockerfile / runpod_start.sh) because their declared requirements
+# conflict with these pins even though they run fine against them.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+requests>=2.31
+
+# Evaluation engine
+faster-whisper>=1.0
+unbabel-comet==2.2.7
+sentence-transformers==5.7.0
+transformers==4.39.3
+tokenizers==0.15.2
+accelerate==0.27.2
+huggingface_hub==0.36.2
+protobuf==4.25.9
+torchmetrics==0.10.3
+numpy==1.26.4
+torch==2.8.0
+
+# Audio handling
+soundfile>=0.12
+librosa>=0.10
+scipy>=1.11
+av>=12.0
+ctranslate2>=4.4
+onnxruntime>=1.18
+safetensors>=0.4
+
+# MetricX-24 is research code with no setup.py. It is cloned at build time
+# (see the Dockerfile) and imports `datasets` at runtime - without this
+# package the MetricX subprocess fails with ModuleNotFoundError.
+datasets>=2.19
+
+# Translation path (POST /translate): NLLB-200 + gTTS
+gTTS>=2.5
+sentencepiece>=0.2

@@ -20,7 +20,9 @@ a fresh timestamped section to ``SER_EVAL_LOG.md`` (overridable via
 
 In batch mode, clips that share the same base name minus their language
 prefix (e.g. ``EN_001_#1.wav`` ↔ ``ES_001_#1.wav``) are paired automatically
-and a cosine match is logged next to the per-clip rows.
+and a cosine match is logged next to the per-clip rows. Even if ``--pattern``
+only globs one language prefix (e.g. ``EN_001_#*.wav``), the driver
+automatically discovers matching counterpart files in ``--batch-dir``.
 """
 
 from __future__ import annotations
@@ -31,9 +33,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Reuse the same loader and inference helpers from the smoke test — when
-# one breaks (e.g. a transformers upgrade changes the safetensors layout),
-# both break, which is what we want.
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from test_audio_emotion import (  # noqa: E402
@@ -45,10 +44,8 @@ from test_audio_emotion import (  # noqa: E402
 
 
 SER_MODEL_NAME = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
-# DRAL (and the [ToPi](https://www.nigelward.com/topi-full-data.zip)
-# fragments used by the demo) ship with two-letter language prefixes
-# like ``EN_`` / ``ES_`` before the underscore.
-LANG_PREFIX_LEN = 2
+# Support both 2-letter (EN_, ES_) and 3-letter (ENG_, SPA_) language prefixes.
+ALLOWED_PREFIX_LENS = (2, 3)
 
 
 # -----------------------------------------------------------------------
@@ -70,18 +67,43 @@ def _ansi(code: str, text: str, enabled: bool) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-def _pair_key(name: str) -> str | None:
-    """Strip the leading 3-letter language prefix to recover the pair key.
+def _split_lang_prefix(name: str) -> tuple[str, str] | None:
+    """Split a filename into ``(lang_prefix, pair_key)``.
 
-    ``EN_001_#1.wav`` → ``001_#1.wav``. Returns None if the prefix doesn't
-    look like a 3-letter language code (i.e. not alphabetic).
+    ``EN_001_#1.wav`` -> ``("EN", "001_#1.wav")``.
+    ``SPA_001_#1.wav`` -> ``("SPA", "001_#1.wav")``.
+    Returns None if the prefix isn't a 2- or 3-letter alphabetic language code.
     """
     if "_" not in name:
         return None
-    head, _, _ = name.partition("_")
-    if len(head) != LANG_PREFIX_LEN or not head.isalpha():
+    head, _, rest = name.partition("_")
+    if len(head) not in ALLOWED_PREFIX_LENS or not head.isalpha() or not rest:
         return None
-    return name[LANG_PREFIX_LEN + 1:]
+    return head.upper(), rest
+
+
+def _pair_key(name: str) -> str | None:
+    """Strip the leading 2- or 3-letter language prefix to recover the pair key."""
+    parsed = _split_lang_prefix(name)
+    return parsed[1] if parsed else None
+
+
+def _expand_counterpart_files(batch_dir: Path, matched_files: list[Path]) -> list[Path]:
+    """If `--pattern` matched only one language side (e.g. `EN_001_#*.wav`),
+    automatically include any counterpart files in `batch_dir` that share the
+    same pair key (e.g. `ES_001_#*.wav`) so pairwise cosine match is computed.
+    """
+    wanted_keys = {k for p in matched_files if (k := _pair_key(p.name)) is not None}
+    if not wanted_keys:
+        return matched_files
+    by_path = {p.resolve(): p for p in matched_files}
+    for candidate in sorted(batch_dir.iterdir()):
+        if not candidate.is_file():
+            continue
+        k = _pair_key(candidate.name)
+        if k in wanted_keys and candidate.resolve() not in by_path:
+            by_path[candidate.resolve()] = candidate
+    return sorted(by_path.values(), key=lambda p: p.name)
 
 
 # -----------------------------------------------------------------------
@@ -174,10 +196,7 @@ def _append_markdown(md_path: Path, mode_label: str, clips: list[dict],
 
 def _predict_all(spec, paths: list[Path], quiet: bool,
                  color: bool) -> dict[Path, list[dict]]:
-    """Run do_audio_emotion on each path exactly once and cache by path.
-
-    Prints per-clip results to the console unless ``quiet`` is set.
-    """
+    """Run do_audio_emotion on each path exactly once and cache by path."""
     out: dict[Path, list[dict]] = {}
     for p in paths:
         preds = do_audio_emotion(spec, str(p))
@@ -193,19 +212,17 @@ def _pair_from_predictions(by_path: dict[Path, list[dict]],
     """Pair clips by language-prefix key and compute cosine matches."""
     grouped: dict[str, dict[str, Path]] = {}
     for p in by_path.keys():
-        k = _pair_key(p.name)
-        if k is None:
+        parsed = _split_lang_prefix(p.name)
+        if parsed is None:
             continue
-        head = p.name[:LANG_PREFIX_LEN]
+        head, k = parsed
         grouped.setdefault(k, {})[head] = p
 
     pairs: list[dict] = []
     for k, sides in grouped.items():
         if len(sides) < 2:
             continue
-        # Sort by language code so the order is deterministic.
         ordered = [sides[h] for h in sorted(sides.keys())]
-        # Match the first side to every other side.
         anchor = ordered[0]
         anchor_preds = by_path[anchor]
         for other in ordered[1:]:
@@ -286,6 +303,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         by_path = _predict_all(spec, [src, tgt], args.quiet, color)
         pairs = _pair_from_predictions(by_path, args.quiet, color)
+        if not pairs:
+            # Explicit --source and --target should always produce a pair match
+            # even if their filenames don't follow the <LANG>_<id> convention.
+            score = compute_affective_match_score(by_path[src], by_path[tgt])
+            pair = {
+                "source": src,
+                "target": tgt,
+                "src_top": by_path[src][0],
+                "tgt_top": by_path[tgt][0],
+                "match": score,
+            }
+            pairs = [pair]
+            if not args.quiet:
+                _print_pair(pair, color)
         clips = [
             {"path": p, "preds": by_path[p], "top": by_path[p][0]}
             for p in (src, tgt)
@@ -299,13 +330,14 @@ def main(argv: list[str] | None = None) -> int:
     if not batch_dir.is_dir():
         print(f"!! not a directory: {batch_dir}", file=sys.stderr)
         return 1
-    files = sorted(batch_dir.glob(args.pattern))
-    if not files:
+    matched = sorted(batch_dir.glob(args.pattern))
+    if not matched:
         print(f"!! no files matched {args.pattern!r} under {batch_dir}",
               file=sys.stderr)
         return 1
-    print(f"batch mode: {len(files)} file(s) matched {args.pattern!r} "
-          f"under {batch_dir}")
+    files = _expand_counterpart_files(batch_dir, matched)
+    print(f"batch mode: {len(matched)} file(s) matched {args.pattern!r} "
+          f"({len(files)} total with counterparts) under {batch_dir}")
     by_path = _predict_all(spec, files, args.quiet, color)
     pairs = _pair_from_predictions(by_path, args.quiet, color)
     clips = [

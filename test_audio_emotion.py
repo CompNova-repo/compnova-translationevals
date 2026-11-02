@@ -7,13 +7,6 @@ same contract as ``DemoApp.do_audio_emotion`` /
 ``DemoApp.compute_affective_match_score`` and exercise it against the
 DRAL paired clips in ``data/dral/``.
 
-The published checkpoint (``transformers 4.8.2`` era) saved its
-classifier head under the two-layer ``dense`` + ``output`` layout.
-Current ``transformers`` uses a single ``classifier`` Linear and would
-silently drop the trained head and re-initialise it with random weights
-(producing near-uniform outputs). We rebuild the matching head by hand
-and patch the head weights in from the saved safetensors.
-
 Usage:
     python test_audio_emotion.py                # uses data/dral/EN_001_#1.wav + ES_001_#1.wav
     python test_audio_emotion.py path/to/file   # runs against one wav
@@ -24,10 +17,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import librosa
 import numpy as np
-import torch
-import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parent
 DRAL_DIR = ROOT / "data" / "dral"
@@ -42,6 +32,8 @@ EXPECTED_LABELS = set(SER_LABELS)
 
 def load_audio_emotion_pipeline():
     """Build the wav2vec2 SER feature extractor + patched head model."""
+    import torch
+    import torch.nn as nn
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
     from transformers import AutoFeatureExtractor, Wav2Vec2Model
@@ -52,9 +44,6 @@ def load_audio_emotion_pipeline():
     dropout_p = getattr(cfg, "final_dropout", 0.1)
     hidden_size = cfg.hidden_size
 
-    # Sequential order matches the loader in DemoApp.load_audio_emotion_pipeline:
-    #   0 = dense (Linear + tanh), 1 = tanh (no params), 2 = dropout (no params),
-    #   3 = out_proj (Linear).
     classifier = nn.Sequential(
         nn.Linear(hidden_size, hidden_size),
         nn.Tanh(),
@@ -71,10 +60,6 @@ def load_audio_emotion_pipeline():
         def forward(self, input_values, attention_mask=None):
             outputs = self.backbone(input_values, attention_mask=attention_mask)
             hidden = outputs.last_hidden_state
-            # Hidden is at the backbone output time-resolution
-            # (post-conv downsampling), so the input-time attention_mask
-            # cannot be applied directly. For single-clip inference we
-            # mean-pool across the full sequence.
             pooled = hidden.mean(dim=1)
             return self.classifier(pooled)
 
@@ -97,6 +82,8 @@ def load_audio_emotion_pipeline():
     print(f"head load: {len(head_weights)} tensors; "
           f"missing={len(missing)} unexpected={len(unexpected)}")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
     model.eval()
     id2label = {i: lbl for i, lbl in enumerate(SER_LABELS)}
     return feature_extractor, model, id2label
@@ -104,12 +91,17 @@ def load_audio_emotion_pipeline():
 
 def do_audio_emotion(spec, audio_path: str) -> list:
     """Load audio at 16 kHz mono and return sorted SER predictions."""
+    import librosa
+    import torch
+
     feature_extractor, model, id2label = spec
     waveform, _ = librosa.load(audio_path, sr=16000, mono=True)
     inputs = feature_extractor(waveform, sampling_rate=16000, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         logits = model(**inputs)
-    probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+    probs = torch.nn.functional.softmax(logits, dim=-1)[0].detach().cpu()
     preds = [
         {"label": id2label[i], "score": float(p)}
         for i, p in enumerate(probs)
@@ -134,6 +126,8 @@ def compute_affective_match_score(src_preds, mt_preds) -> float:
 
 def _check_run(spec, audio_path: Path) -> dict:
     """Run predictions against one file and assert the public contract."""
+    import librosa
+
     print(f"\n=== {audio_path.name} ===")
     sr = librosa.get_samplerate(str(audio_path))
     duration = librosa.get_duration(path=str(audio_path))
