@@ -54,6 +54,52 @@ target-language tokenizer coverage.
 | `packages.txt` | `ffmpeg` — required system dep for audio decoding on HF Spaces. |
 | `example_secrets.toml` | Template for `HF_TOKEN`. Don't commit a real token. |
 | `LICENSE` | Repository license. |
+| `API/` | The evaluation service: `api.py` (FastAPI), `eval_core.py` (the pipeline), `eval_store.py` (SQLite), `config.py`, `errors.py`, Dockerfiles, `runpod_start.sh` and `verify_setup.sh`. |
+| `API/API_GUIDE.md` | **Programmatic guide** - every endpoint, request/response contracts, errors, retries, idempotency, score interpretation, performance, and the folder -> cron -> API pipeline. |
+| `API/ROADMAP.md` | What was built in 2.0, and what is still open. |
+| `API/cron/` | The automation pipeline: batch runner, cron installer, and a mock API for offline testing. |
+
+## Programmatic API and the automation pipeline
+
+The evaluation engine is also available over HTTP, so audio can be scored without a
+browser. The **automation pipeline** wires a cron job to a watched folder: audio lands
+in `inbox/`, the job submits it to the API, and the results come back as a local
+ledger and in the dashboard.
+
+```bash
+# start the service
+bash API/runpod_start.sh
+
+# install the pipeline: audio in a folder -> evaluated
+bash API/runpod_start.sh --install-cron
+
+# check the whole system end to end
+bash API/verify_setup.sh
+```
+
+| Path | Role |
+| --- | --- |
+| `API/api.py` | The service: evaluation, translation, the job queue, and the stored-results API. |
+| `API/API_GUIDE.md` | The programmatic contract - start here. |
+| `API/ROADMAP.md` | What is done, and what is still open. |
+| `API/RUNPOD_SETUP.md` | Bringing the service up on a RunPod pod. |
+| `API/cron/` | Batch runner, cron installer, and a mock API for testing without a GPU. |
+| `API/verify_setup.sh` | End-to-end check: readiness, an evaluation, the job API, idempotency, cron, dashboard. |
+
+```bash
+# evaluate a pair
+curl -s -X POST http://localhost:8000/evaluate \
+  -F "source_audio=@/data/EN_001.wav" \
+  -F "target_audio=@/data/ES_001.wav"
+
+# or queue it and poll - safe behind a proxy that times out
+curl -s -X POST http://localhost:8000/jobs \
+  -F "source_audio=@/data/EN_001.wav" \
+  -F "target_audio=@/data/ES_001.wav"
+```
+
+The dashboard (port 8501) reads the same store and can start evaluations itself from
+its **New evaluation** tab.
 
 ## Affective tone (SER)
 

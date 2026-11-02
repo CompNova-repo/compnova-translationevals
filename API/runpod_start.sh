@@ -24,8 +24,9 @@ MODE=start
 case "${1:-}" in
   --restart) MODE=restart ;;
   --check)   MODE=check ;;
+  --install-cron) MODE=install_cron ;;
   "")        ;;
-  *) echo "Unknown option: $1 (use --restart or --check)"; exit 2 ;;
+  *) echo "Unknown option: $1 (use --restart, --check or --install-cron)"; exit 2 ;;
 esac
 
 # ---------- settings ----------
@@ -39,6 +40,18 @@ METRICX_REPO=https://github.com/google-research/metricx.git
 METRICX_COMMIT=fc4978eb064670f7cc33e93ea4f52d38396b8ae6
 API_PORT=8000
 UI_PORT=8501
+
+# Persistent state. The SQLite store of evaluations and the upload spool.
+# Default: the pod's own disk (fast and consistent). Point EVAL_DB_PATH at a
+# /workspace path if you want results to survive the pod being recreated.
+DATA_DIR="${S2ST_DATA_DIR:-/var/lib/compnova}"
+EVAL_DB_PATH="${EVAL_DB_PATH:-$DATA_DIR/evaluations.db}"
+EVAL_SPOOL_DIR="${EVAL_SPOOL_DIR:-$DATA_DIR/spool}"
+mkdir -p "$DATA_DIR" "$EVAL_SPOOL_DIR"
+
+# Pipeline directory watched by the cron job.
+PIPELINE_DIR="${S2ST_PIPELINE_DIR:-/workspace/eval-pipeline}"
+CRON_INTERVAL_MIN="${S2ST_CRON_INTERVAL_MIN:-10}"
 
 # Logs go on the pod's own disk: the shared /workspace volume shows new writes late.
 LOG_DIR="${S2ST_LOG_DIR:-/root/logs}"
@@ -60,6 +73,20 @@ flock -n 9 || fail "runpod_start.sh is already running in another terminal."
 unset GIT_CONFIG_PARAMETERS || true
 export HF_HOME="$MODEL_CACHE"
 export USE_TF=0 USE_TORCH=1
+
+# Service configuration (see API/config.py).
+export EVAL_DB_PATH
+export EVAL_SPOOL_DIR
+export METRICX_DIR=/opt/metricx
+export EVAL_API_KEYS="${EVAL_API_KEYS:-}"
+export EVAL_JOB_WORKERS="${EVAL_JOB_WORKERS:-1}"
+export EVAL_JOB_BATCH_SIZE="${EVAL_JOB_BATCH_SIZE:-8}"
+export EVAL_MAX_UPLOAD_MB="${EVAL_MAX_UPLOAD_MB:-200}"
+export EVAL_MAX_AUDIO_SECONDS="${EVAL_MAX_AUDIO_SECONDS:-1800}"
+export EVAL_TRANSLATE_ENABLED="${EVAL_TRANSLATE_ENABLED:-1}"
+export EVAL_API_URL="http://localhost:$API_PORT"
+export EVAL_API_KEY="${EVAL_API_KEY:-$EVAL_API_KEYS}"
+
 # RunPod images set HF_HUB_ENABLE_HF_TRANSFER=1 without installing hf_transfer, which makes every download fail.
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore PIP_BREAK_SYSTEM_PACKAGES=1
@@ -81,6 +108,17 @@ if [ "$MODE" = check ]; then
   say "Status"
   if api_up; then info "API: running"; else info "API: NOT running"; fi
   if ui_up;  then info "Dashboard: running"; else info "Dashboard: NOT running"; fi
+  if curl -sf "localhost:$API_PORT/health/ready" >/dev/null 2>&1; then
+    info "Models: loaded"
+  else
+    info "Models: loading or failed - check $API_LOG"
+  fi
+  info "Database: $EVAL_DB_PATH"
+  if [ -f /etc/cron.d/compnova-eval ]; then
+    info "Cron: installed"
+  else
+    info "Cron: not installed - run: bash runpod_start.sh --install-cron"
+  fi
   info "Logs: $API_LOG, $UI_LOG"
   exit 0
 fi
@@ -114,6 +152,12 @@ BASHRC_BLOCK="# S2ST env (added by runpod_start.sh)
 unset GIT_CONFIG_PARAMETERS
 export HF_HOME=$MODEL_CACHE
 export USE_TF=0 USE_TORCH=1
+export EVAL_DB_PATH=$EVAL_DB_PATH
+export EVAL_SPOOL_DIR=$EVAL_SPOOL_DIR
+export METRICX_DIR=/opt/metricx
+export EVAL_API_KEYS="$EVAL_API_KEYS"
+export EVAL_API_URL="$EVAL_API_URL"
+export EVAL_API_KEY="$EVAL_API_KEY"
 export HF_HUB_ENABLE_HF_TRANSFER=0
 [ -f /workspace/python_patches/sitecustomize.py ] && export PYTHONPATH=/workspace/python_patches
 # end S2ST env"
@@ -324,7 +368,12 @@ if api_up; then
 else
   pkill -f "[u]vicorn api:app" || true
   sleep 2
-  setsid nohup "$PY" -m uvicorn api:app --host 0.0.0.0 --port "$API_PORT" > "$API_LOG" 2>&1 < /dev/null 9>&- &
+  setsid nohup env EVAL_DB_PATH="$EVAL_DB_PATH" EVAL_SPOOL_DIR="$EVAL_SPOOL_DIR" \
+      METRICX_DIR=/opt/metricx EVAL_API_KEYS="$EVAL_API_KEYS" \
+      EVAL_JOB_WORKERS="$EVAL_JOB_WORKERS" EVAL_JOB_BATCH_SIZE="$EVAL_JOB_BATCH_SIZE" \
+      EVAL_MAX_UPLOAD_MB="$EVAL_MAX_UPLOAD_MB" EVAL_MAX_AUDIO_SECONDS="$EVAL_MAX_AUDIO_SECONDS" \
+      EVAL_TRANSLATE_ENABLED="$EVAL_TRANSLATE_ENABLED" HF_HOME="$HF_HOME" \
+      "$PY" -m uvicorn api:app --host 0.0.0.0 --port "$API_PORT" > "$API_LOG" 2>&1 < /dev/null 9>&- &
   echo -n "   loading models"
   sleep 5
   for _ in $(seq 1 180); do
@@ -339,6 +388,8 @@ else
   echo
   api_up || { tail -30 "$API_LOG"; fail "API still not answering after 15 minutes."; }
   info "started"
+  info "database: $EVAL_DB_PATH"
+  if [ -n "$EVAL_API_KEYS" ]; then info "auth: enabled (X-API-Key)"; else info "auth: OPEN - set EVAL_API_KEYS before sharing the URL"; fi
 fi
 
 # ---------- 8. dashboard ----------
@@ -360,6 +411,18 @@ else
   info "started"
 fi
 
+# ---------- 9. cron job ----------
+if [ "$MODE" = install_cron ]; then
+  say "9/9 Cron job for the audio pipeline"
+  bash "$SCRIPT_DIR/cron/install_cron.sh" \
+      --inbox "$PIPELINE_DIR/inbox" \
+      --api-url "http://localhost:$API_PORT" \
+      --interval-min "$CRON_INTERVAL_MIN" \
+      --log "$LOG_DIR/eval-batch.log"
+  info "pipeline directory: $PIPELINE_DIR"
+  exit 0
+fi
+
 echo
 echo "All up."
 if [ -n "${RUNPOD_POD_ID:-}" ]; then
@@ -371,3 +434,9 @@ else
   echo "  API docs:  http://localhost:${API_PORT}/docs"
 fi
 echo "  Logs:      $API_LOG and $UI_LOG"
+echo "  Database:  $EVAL_DB_PATH"
+if [ -f /etc/cron.d/compnova-eval ]; then
+  echo "  Cron:      installed - drop audio into $PIPELINE_DIR/inbox"
+else
+  echo "  Cron:      not installed - run: bash runpod_start.sh --install-cron"
+fi
