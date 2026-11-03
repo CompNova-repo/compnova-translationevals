@@ -122,8 +122,9 @@ def _encode_spans(texts, max_merge: int):
 
 
 def align_segments_by_content(src_segments, mt_segments, min_similarity: float = 0.5, max_merge: int = 2):
-    """Align source and translation segments by MEANING (LaBSE embeddings
-    + monotonic dynamic programming), allowing 1-1, 1-2, 2-1, 2-2 merges.
+    """Align source and translation segments by MEANING (multilingual
+    sentence embeddings + monotonic dynamic programming), allowing 1-1,
+    1-2, 2-1, 2-2 merges.
     Segments that can't find an acceptable match are returned separately
     as unmatched, never force-paired or silently dropped."""
     n, m = len(src_segments), len(mt_segments)
@@ -268,8 +269,8 @@ def evaluate_pair(src_audio_path: str, mt_audio_path: str, min_similarity: float
         chunks.append({
             "source": p["src"],
             "target": p["mt"],
-            "comet_kiwi": comet_scores[idx] if idx < len(comet_scores) else None,
-            "metricx_24": metricx_scores[idx] if idx < len(metricx_scores) else None,
+            "semantic_quality": comet_scores[idx] if idx < len(comet_scores) else None,
+            "reference_free_quality": metricx_scores[idx] if idx < len(metricx_scores) else None,
             "source_sentiment": s_label,
             "target_sentiment": m_label,
             "sentiment_match": match,
@@ -286,8 +287,8 @@ def evaluate_pair(src_audio_path: str, mt_audio_path: str, min_similarity: float
         "summary": {
             "chunks": len(pairs),
             "unmatched": len(unmatched_src) + len(unmatched_mt),
-            "comet_kiwi": avg_comet,
-            "metricx_24": avg_metricx,
+            "semantic_quality": avg_comet,
+            "reference_free_quality": avg_metricx,
             "sentiment_agreement_pct": sentiment_agreement_pct,
         },
         "chunks": chunks,

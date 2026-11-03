@@ -12,7 +12,7 @@
 #
 # Optional settings (environment variables):
 #   HF_TOKEN            Hugging Face token. Needed once per pod to download the gated
-#                       COMET-Kiwi model. If unset, the script looks for a saved token,
+#                       gated scoring model. If unset, the script looks for a saved token,
 #                       then asks for one.
 #   S2ST_MODEL_CACHE    Where models are downloaded (default /root/hf-cache, on the pod's
 #                       own disk; the shared /workspace volume proved unreliable for this).
@@ -200,9 +200,9 @@ say "4/8 Library fixes"
 FW_AUDIO=$("$PY" -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'audio.py'))")
 if grep -q "metadata_errors" "$FW_AUDIO"; then
   sed -i 's/, metadata_errors="ignore"//' "$FW_AUDIO"
-  info "patched faster-whisper for PyAV"
+  info "patched the audio library for PyAV"
 else
-  info "faster-whisper already patched"
+  info "audio library already patched"
 fi
 # CTranslate2 (Whisper) needs the CUDA 12 libraries that torch installs via pip.
 CUDA_LIBS=$("$PY" - <<'EOF'
@@ -226,7 +226,7 @@ if [ -n "$CUDA_LIBS" ]; then
 fi
 
 # ---------- 5. MetricX ----------
-say "5/8 MetricX at the pinned commit"
+say "5/8 Quality scorer at the pinned commit"
 if [ ! -f "$METRICX_DIR/metricx24/predict.py" ]; then
   info "cloning into $METRICX_DIR (container disk; git can't write to /workspace)"
   rm -rf "$METRICX_DIR"
@@ -243,7 +243,7 @@ if [ ! -e metricx ]; then
   ln -s "$METRICX_DIR" metricx
   info "linked API/metricx -> $METRICX_DIR"
 fi
-[ -f metricx/metricx24/predict.py ] || fail "API/metricx does not lead to MetricX. Check: ls -la $REPO_DIR/metricx"
+[ -f metricx/metricx24/predict.py ] || fail "API/metricx does not lead to the quality scorer. Check: ls -la $REPO_DIR/metricx"
 
 # ---------- 6. models ----------
 say "6/8 Models in $MODEL_CACHE"
@@ -267,15 +267,30 @@ HF_HUB_DISABLE_XET=1 "$PY" - <<'EOF' || fail "model download failed (see above).
 import os, sys
 from huggingface_hub import snapshot_download
 
+# (repository, allow_patterns). The repositories are an internal detail:
+# the progress output below uses generic labels, never the model names.
 MODELS = [
     ("mobiuslabsgmbh/faster-whisper-large-v3-turbo", None),
     ("Unbabel/wmt22-cometkiwi-da", None),
     ("microsoft/infoxlm-large", None),
     ("google/metricx-24-hybrid-large-v2p6-bfloat16", None),
-    ("google/mt5-xl", ["*.json", "*.model"]),   # MetricX only needs the tokenizer
+    ("google/mt5-xl", ["*.json", "*.model"]),   # the quality scorer only needs the tokenizer
     ("sentence-transformers/LaBSE", None),
     ("tabularisai/multilingual-sentiment-analysis", None),
 ]
+
+LABELS = {
+    "mobiuslabsgmbh/faster-whisper-large-v3-turbo": "transcription model",
+    "Unbabel/wmt22-cometkiwi-da": "quality model A",
+    "microsoft/infoxlm-large": "auxiliary model",
+    "google/metricx-24-hybrid-large-v2p6-bfloat16": "quality model B",
+    "google/mt5-xl": "quality model B tokenizer",
+    "sentence-transformers/LaBSE": "alignment model",
+    "tabularisai/multilingual-sentiment-analysis": "sentiment model",
+}
+
+def label(repo):
+    return LABELS.get(repo, "model")
 
 # Weight formats this project never loads.
 SKIP = ["*.h5", "*.msgpack", "*.onnx", "onnx/*", "*.ot", "rust_model*", "openvino/*", "*.tflite"]
@@ -294,21 +309,21 @@ for repo, patterns in MODELS:
         except Exception as e:
             msg = str(e).splitlines()[0][:200]
             if "gated" in type(e).__name__.lower() or "401" in msg or "403" in msg:
-                print(f"   {repo}: access denied. Accept its terms on huggingface.co with the account that owns this token.")
+                print(f"   {label(repo)}: access denied. Accept its terms on huggingface.co with the account that owns this token: {repo}")
                 break
-            print(f"   {repo}: download error ({type(e).__name__}: {msg}); retrying" if attempt == 1 else f"   {repo}: download error again")
+            print(f"   {label(repo)}: download error ({type(e).__name__}: {msg}); retrying" if attempt == 1 else f"   {label(repo)}: download error again")
             continue
         bad = empty_files(path)
         if not bad:
-            print(f"   {repo}: ok")
+            print(f"   {label(repo)}: ok")
             ok = True
             break
-        print(f"   {repo}: {len(bad)} empty file(s), re-downloading")
+        print(f"   {label(repo)}: {len(bad)} empty file(s), re-downloading")
     if not ok:
         failed.append(repo)
 
 if failed:
-    print("   could not get: " + ", ".join(failed))
+    print("   could not get: " + ", ".join(label(r) for r in failed))
     sys.exit(1)
 EOF
 

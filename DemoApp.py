@@ -17,8 +17,29 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 DEFAULT_API_URL = os.environ.get("EVAL_API_URL", "http://localhost:8000")
-COMET_FLAG_THRESHOLD = 0.4  # same threshold as run_eval_v3.py
-METRICX_MAX = 25.0          # MetricX shown as 1 - score/25, to match COMET's 0-1 scale
+QUALITY_A_THRESHOLD = 0.4  # a chunk scoring below this on Model Alpha is flagged
+QUALITY_B_MAX = 25.0        # Model Beta is 0-25; charted as 1 - score/25 so both share one 0-1 axis
+
+# Names shown to viewers. The underlying models are not named anywhere in the UI.
+SCORE_A = "Model Alpha"     # semantic quality, 0-1, higher is better
+SCORE_B = "Model Beta"      # reference-free quality, raw 0-25, lower is better; charted as 1 - score/25
+DISPLAY_NAMES = {
+    "semantic_quality": f"{SCORE_A} score",
+    "reference_free_quality": f"{SCORE_B} score (0-25, lower is better)",
+    "sentiment_agreement_pct": "Sentiment agreement %",
+    "chunks": "Sentence pairs",
+    "unmatched": "Unmatched sentences",
+    "source_sentiment": "Source sentiment",
+    "target_sentiment": "Target sentiment",
+    "sentiment_match": "Sentiment match",
+    "source": "Source",
+    "target": "Target",
+}
+
+
+def display_name(key):
+    key = str(key)
+    return DISPLAY_NAMES.get(key, key.replace("_", " ").capitalize())
 
 st.set_page_config(page_title="S2ST evaluation monitor", layout="wide")
 
@@ -53,6 +74,14 @@ def find_col(df, *needles):
     return None
 
 
+def find_quality_cols(df):
+    """Locate the two quality-score columns by their neutral field names."""
+    alpha_col = find_col(df, "semantic_quality")
+    beta_norm_col = find_col(df, "reference_free_quality", "norm")
+    beta_raw_col = find_col(df, "reference_free_quality")
+    return alpha_col, beta_norm_col, beta_raw_col
+
+
 # ---------- sections ----------
 
 def render_summary(summary):
@@ -67,7 +96,7 @@ def render_summary(summary):
         cols = st.columns(min(len(scalars), 4))
         for i, (key, val) in enumerate(scalars.items()):
             shown = f"{val:.3f}" if isinstance(val, float) else str(val)
-            cols[i % len(cols)].metric(str(key).replace("_", " ").capitalize(), shown)
+            cols[i % len(cols)].metric(display_name(key), shown)
     nested = {k: v for k, v in summary.items() if k not in scalars}
     if nested:
         with st.expander("Other summary fields"):
@@ -130,7 +159,7 @@ def render_score_chart(scores, flagged, eval_id):
     ).add_params(pick)
     layers = [lines, points]
 
-    flagged_points = long[(long["metric"] == "COMET-Kiwi") & long["chunk"].isin(flagged)]
+    flagged_points = long[(long["metric"] == SCORE_A) & long["chunk"].isin(flagged)]
     if not flagged_points.empty:
         layers.append(
             alt.Chart(flagged_points)
@@ -144,26 +173,26 @@ def render_score_chart(scores, flagged, eval_id):
     return selected_chunk_from(event)
 
 
-def render_chunk_details(df, comet_col, flagged, selected):
+def render_chunk_details(df, alpha_col, flagged, selected):
     st.subheader("Chunk details")
     text_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     for i, row in df.iterrows():
         st.markdown(f"<div id='chunk-{i}'></div>", unsafe_allow_html=True)
         label = f"Chunk {i}"
-        if comet_col:
-            label += f", COMET {row[comet_col]:.3f}"
+        if alpha_col:
+            label += f", {SCORE_A} {row[alpha_col]:.3f}"
         if i in flagged:
             label += ", below threshold"
         if i == selected:
             label = f"Selected: {label}"  # new label = new element, so it opens expanded
         with st.expander(label, expanded=(i == selected)):
             for col in text_cols:
-                st.markdown(f"**{col}**")
+                st.markdown(f"**{display_name(col)}**")
                 st.write(str(row[col]))
             if num_cols:
                 st.caption(", ".join(
-                    f"{col}: {row[col]:.3f}" if isinstance(row[col], float) else f"{col}: {row[col]}"
+                    f"{display_name(col)}: {row[col]:.3f}" if isinstance(row[col], float) else f"{display_name(col)}: {row[col]}"
                     for col in num_cols
                 ))
 
@@ -178,45 +207,46 @@ def render_chunks(chunks, eval_id):
     df.index = range(1, len(df) + 1)
     df.index.name = "chunk"
 
-    comet_col = find_col(df, "comet")
-    mx_norm_col = find_col(df, "metricx", "norm")
-    mx_raw_col = find_col(df, "metricx")
+    alpha_col, beta_norm_col, beta_raw_col = find_quality_cols(df)
 
     scores = pd.DataFrame(index=df.index)
-    if comet_col:
-        scores["COMET-Kiwi"] = df[comet_col]
-    if mx_norm_col:
-        scores["MetricX (normalised)"] = df[mx_norm_col]
-    elif mx_raw_col:
-        scores["MetricX (normalised)"] = (1 - df[mx_raw_col] / METRICX_MAX).clip(0, 1)
+    if alpha_col:
+        scores[SCORE_A] = df[alpha_col]
+    if beta_norm_col:
+        scores[f"{SCORE_B} (normalised)"] = df[beta_norm_col]
+    elif beta_raw_col:
+        scores[f"{SCORE_B} (normalised)"] = (1 - df[beta_raw_col] / QUALITY_B_MAX).clip(0, 1)
 
     flagged = []
-    if comet_col:
-        flagged = df.index[df[comet_col] < COMET_FLAG_THRESHOLD].tolist()
+    if alpha_col:
+        flagged = df.index[df[alpha_col] < QUALITY_A_THRESHOLD].tolist()
         if flagged:
             st.warning(
-                f"{len(flagged)} chunk(s) scored below COMET {COMET_FLAG_THRESHOLD}: "
+                f"{len(flagged)} chunk(s) scored below {SCORE_A} {QUALITY_A_THRESHOLD}: "
                 + ", ".join(map(str, flagged))
             )
         else:
-            st.success(f"No chunks scored below COMET {COMET_FLAG_THRESHOLD}.")
+            st.success(f"No chunks scored below {SCORE_A} {QUALITY_A_THRESHOLD}.")
 
     selected = None
     if len(scores.columns):
         selected = render_score_chart(scores, flagged, eval_id)
         st.caption("Click a point to open that chunk below. Click empty space to clear.")
     else:
-        st.caption("No COMET or MetricX columns found in the chunk data, so there is no chart.")
+        st.caption("No quality-score columns found in the chunk data, so there is no chart.")
+
+    shown = df.rename(columns=display_name)
+    flag_col = display_name(alpha_col) if alpha_col else None
 
     def highlight(row):
         if row.name == selected:
             return ["background-color: rgba(60, 130, 255, 0.22)"] * len(row)
-        if comet_col and row[comet_col] < COMET_FLAG_THRESHOLD:
+        if flag_col and row[flag_col] < QUALITY_A_THRESHOLD:
             return ["background-color: rgba(255, 75, 75, 0.18)"] * len(row)
         return [""] * len(row)
-    st.dataframe(df.style.apply(highlight, axis=1).format(precision=3))
+    st.dataframe(shown.style.apply(highlight, axis=1).format(precision=3))
 
-    render_chunk_details(df, comet_col, flagged, selected)
+    render_chunk_details(df, alpha_col, flagged, selected)
     if selected is not None:
         scroll_to(f"chunk-{selected}")
 

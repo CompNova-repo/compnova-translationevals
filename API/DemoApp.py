@@ -17,15 +17,15 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 DEFAULT_API_URL = os.environ.get("EVAL_API_URL", "http://localhost:8000")
-COMET_FLAG_THRESHOLD = 0.4  # same threshold as run_eval_v3.py
-METRICX_MAX = 25.0          # MetricX shown as 1 - score/25, to match COMET's 0-1 scale
+QUALITY_A_THRESHOLD = 0.4  # a chunk scoring below this on Model Alpha is flagged
+QUALITY_B_MAX = 25.0        # Model Beta is 0-25; charted as 1 - score/25 so both share one 0-1 axis
 
 # Names shown to viewers. The underlying models are not named anywhere in the UI.
-SCORE_A = "Model Alpha"     # COMET-Kiwi (0-1, higher is better)
-SCORE_B = "Model Beta"      # MetricX-24 (raw 0-25, lower is better; charted as 1 - score/25)
+SCORE_A = "Model Alpha"     # semantic quality, 0-1, higher is better
+SCORE_B = "Model Beta"      # reference-free quality, raw 0-25, lower is better; charted as 1 - score/25
 DISPLAY_NAMES = {
-    "comet_kiwi": f"{SCORE_A} score",
-    "metricx_24": f"{SCORE_B} score (0-25, lower is better)",
+    "semantic_quality": f"{SCORE_A} score",
+    "reference_free_quality": f"{SCORE_B} score (0-25, lower is better)",
     "sentiment_agreement_pct": "Sentiment agreement %",
     "chunks": "Sentence pairs",
     "unmatched": "Unmatched sentences",
@@ -90,6 +90,14 @@ def find_col(df, *needles):
     return None
 
 
+def find_quality_cols(df):
+    """Locate the two quality-score columns by their neutral field names."""
+    alpha_col = find_col(df, "semantic_quality")
+    beta_norm_col = find_col(df, "reference_free_quality", "norm")
+    beta_raw_col = find_col(df, "reference_free_quality")
+    return alpha_col, beta_norm_col, beta_raw_col
+
+
 # ---------- sections ----------
 
 def render_summary(summary):
@@ -144,7 +152,7 @@ def build_score_chart(scores, flagged):
     return alt.layer(*layers).properties(height=300, width="container")
 
 
-def render_interactive_chunks(chart, df, comet_col, flagged):
+def render_interactive_chunks(chart, df, alpha_col, flagged):
     """Chart plus chunk list in one browser-side component.
 
     Clicking a point opens and scrolls to that chunk entirely in the browser,
@@ -156,8 +164,8 @@ def render_interactive_chunks(chart, df, comet_col, flagged):
     items = []
     for i, row in df.iterrows():
         label = f"Chunk {i}"
-        if comet_col:
-            label += f", {SCORE_A} {row[comet_col]:.3f}"
+        if alpha_col:
+            label += f", {SCORE_A} {row[alpha_col]:.3f}"
         if i in flagged:
             label += ", below threshold"
         # Transcript text comes from audio we don't control, so it is always escaped.
@@ -233,40 +241,38 @@ def render_chunks(chunks):
     df.index = range(1, len(df) + 1)
     df.index.name = "chunk"
 
-    comet_col = find_col(df, "comet")
-    mx_norm_col = find_col(df, "metricx", "norm")
-    mx_raw_col = find_col(df, "metricx")
+    alpha_col, beta_norm_col, beta_raw_col = find_quality_cols(df)
 
     scores = pd.DataFrame(index=df.index)
-    if comet_col:
-        scores[SCORE_A] = df[comet_col]
-    if mx_norm_col:
-        scores[f"{SCORE_B} (normalised)"] = df[mx_norm_col]
-    elif mx_raw_col:
-        scores[f"{SCORE_B} (normalised)"] = (1 - df[mx_raw_col] / METRICX_MAX).clip(0, 1)
+    if alpha_col:
+        scores[SCORE_A] = df[alpha_col]
+    if beta_norm_col:
+        scores[f"{SCORE_B} (normalised)"] = df[beta_norm_col]
+    elif beta_raw_col:
+        scores[f"{SCORE_B} (normalised)"] = (1 - df[beta_raw_col] / QUALITY_B_MAX).clip(0, 1)
 
     flagged = []
-    if comet_col:
-        flagged = df.index[df[comet_col] < COMET_FLAG_THRESHOLD].tolist()
+    if alpha_col:
+        flagged = df.index[df[alpha_col] < QUALITY_A_THRESHOLD].tolist()
         if flagged:
             st.warning(
-                f"{len(flagged)} sentence pair(s) scored below {SCORE_A} {COMET_FLAG_THRESHOLD}: "
+                f"{len(flagged)} sentence pair(s) scored below {SCORE_A} {QUALITY_A_THRESHOLD}: "
                 + ", ".join(map(str, flagged))
             )
         else:
-            st.success(f"No sentence pairs scored below {SCORE_A} {COMET_FLAG_THRESHOLD}.")
+            st.success(f"No sentence pairs scored below {SCORE_A} {QUALITY_A_THRESHOLD}.")
 
     if len(scores.columns):
-        render_interactive_chunks(build_score_chart(scores, flagged), df, comet_col, flagged)
+        render_interactive_chunks(build_score_chart(scores, flagged), df, alpha_col, flagged)
     else:
         st.caption("No score columns found in the result, so there is no chart.")
 
     with st.expander("All sentence pairs as a table"):
         shown = df.rename(columns=display_name)
-        if comet_col:
-            flag_col = display_name(comet_col)
+        if alpha_col:
+            flag_col = display_name(alpha_col)
             def highlight(row):
-                bad = row[flag_col] < COMET_FLAG_THRESHOLD
+                bad = row[flag_col] < QUALITY_A_THRESHOLD
                 return ["background-color: rgba(255, 75, 75, 0.18)" if bad else ""] * len(row)
             st.dataframe(shown.style.apply(highlight, axis=1).format(precision=3))
         else:

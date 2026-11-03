@@ -15,6 +15,26 @@ from contextlib import closing
 DB_PATH = os.environ.get("EVAL_DB_PATH", "evaluations.db")
 _lock = threading.Lock()
 
+# Field names used before the score fields were renamed to neutral ones.
+# Stored evaluations keep their original keys, so they are normalised on read
+# and a client never sees an internal name.
+_LEGACY_FIELD_NAMES = {
+    "comet_kiwi": "semantic_quality",
+    "metricx_24": "reference_free_quality",
+}
+
+
+def _normalise_result(obj):
+    """Rename legacy field names anywhere in a stored result."""
+    if isinstance(obj, dict):
+        return {
+            _LEGACY_FIELD_NAMES.get(k, k): _normalise_result(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_normalise_result(v) for v in obj]
+    return obj
+
 
 def _connect():
     conn = sqlite3.connect(DB_PATH)
@@ -91,7 +111,7 @@ def get_evaluation(eval_id):
         ).fetchone()
     if row is None:
         return None
-    return {**_meta(row), "result": json.loads(row["result_json"])}
+    return {**_meta(row), "result": _normalise_result(json.loads(row["result_json"]))}
 
 
 def get_latest():
