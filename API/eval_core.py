@@ -569,14 +569,22 @@ def evaluate_ser_pair(src_path: str, mt_path: str) -> dict:
 # transcription
 # --------------------------------------------------------------------------- #
 
-def transcribe_segments(filepath: str) -> list[str]:
+def transcribe_segments(filepath: str, windows=None) -> list[str]:
+    """Transcribe an audio file.
+
+    `windows` is an optional list of (start, end) seconds. When given, only
+    those parts of the file are transcribed - used by the audio-quality
+    filter to score the dominant speaker only.
+    """
     whisper_model = get_whisper()
-    segments, _info = whisper_model.transcribe(
-        filepath,
+    kwargs = dict(
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
     )
+    if windows:
+        kwargs["clip_timestamps"] = [(float(a), float(b)) for a, b in windows]
+    segments, _info = whisper_model.transcribe(filepath, **kwargs)
     return [seg.text.strip() for seg in segments if seg.text.strip()]
 
 
@@ -763,8 +771,10 @@ def sentiment_batch(texts):
 # --------------------------------------------------------------------------- #
 
 def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
-              src_sent, mt_sent, src_text, mt_text, timings, ser_info=None) -> dict:
+              src_sent, mt_sent, src_text, mt_text, timings, ser_info=None,
+              audio_quality=None) -> dict:
     ser_info = ser_info or {}
+    audio_quality = audio_quality or {}
     chunks = []
     sentiment_matches = []
     for idx, p in enumerate(pairs):
@@ -811,10 +821,108 @@ def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
             "target_emotion_top1": tgt_emotion_top1,
         },
         "ser": ser_info,
+        "audio_quality": audio_quality,
         "chunks": chunks,
         "unmatched": {"source": unmatched_src, "target": unmatched_mt},
         "timings": timings,
     }
+
+
+# --------------------------------------------------------------------------- #
+# audio quality (noise / multiple speakers / overlapping speech)
+# --------------------------------------------------------------------------- #
+
+def analyse_audio_quality(path: str, target_path: str | None = None) -> dict:
+    """Public entry point: measure a recording before it is evaluated.
+
+    Always runs the analysis, whatever EVAL_AUDIO_QUALITY_MODE is set to -
+    the mode only controls what the *evaluation* pipeline does with the
+    result. Returns the noise / speaker / overlap report.
+    """
+    try:
+        import audio_quality as aq
+    except Exception as exc:  # pragma: no cover - import guard
+        raise RuntimeError(f"audio quality analysis unavailable: {exc}") from exc
+
+    kwargs = dict(
+        snr_floor_db=config.AUDIO_QUALITY_SNR_FLOOR_DB,
+        min_speech_ratio=config.AUDIO_QUALITY_MIN_SPEECH_RATIO,
+        max_dominant_ratio=config.AUDIO_QUALITY_MAX_DOMINANT_RATIO,
+        max_overlap_ratio=config.AUDIO_QUALITY_MAX_OVERLAP_RATIO,
+        use_diarization=config.AUDIO_QUALITY_DIARIZATION,
+        use_language_id=config.AUDIO_QUALITY_LANGUAGE_ID,
+    )
+
+    src = aq.analyze(path, **kwargs)
+    report = {
+        "source": aq.public(src),
+        "flags": list(src.get("flags", [])),
+        "contaminated": bool(src.get("contaminated")),
+        "usable": bool(src.get("usable")),
+    }
+    if target_path:
+        tgt = aq.analyze(target_path, **kwargs)
+        report["target"] = aq.public(tgt)
+        report["flags"] = sorted(set(report["flags"]) | set(tgt.get("flags", [])))
+        report["contaminated"] = bool(src.get("contaminated") or tgt.get("contaminated"))
+        report["usable"] = bool(src.get("usable") and tgt.get("usable"))
+    return report
+
+
+def _analyse_pair_quality(source_path: str, target_path: str):
+    """Measure both recordings and decide which audio to score.
+
+    Returns (report, source_path_for_ser, target_path_for_ser).
+
+    * mode "flag"   - the report describes the noise / speakers / overlap; the
+      score is still computed on the full recording (nothing is hidden).
+    * mode "filter" - the transcription and the SER model only see the
+      dominant speaker's windows, so background voices in another language
+      cannot contaminate the score.
+    """
+    try:
+        import audio_quality as aq
+    except Exception as exc:  # pragma: no cover - import guard
+        LOG.warning("audio_quality module unavailable: %s", exc)
+        return {}, source_path, target_path
+
+    kwargs = dict(
+        snr_floor_db=config.AUDIO_QUALITY_SNR_FLOOR_DB,
+        min_speech_ratio=config.AUDIO_QUALITY_MIN_SPEECH_RATIO,
+        max_dominant_ratio=config.AUDIO_QUALITY_MAX_DOMINANT_RATIO,
+        max_overlap_ratio=config.AUDIO_QUALITY_MAX_OVERLAP_RATIO,
+        use_diarization=config.AUDIO_QUALITY_DIARIZATION,
+        use_language_id=config.AUDIO_QUALITY_LANGUAGE_ID,
+    )
+
+    try:
+        src = aq.analyze(source_path, **kwargs)
+        tgt = aq.analyze(target_path, **kwargs)
+    except Exception as exc:
+        LOG.warning("audio quality analysis failed: %s", exc)
+        return {}, source_path, target_path
+
+    report = {
+        "source": aq.public(src),
+        "target": aq.public(tgt),
+        "flags": sorted(set(src.get("flags", [])) | set(tgt.get("flags", []))),
+        "contaminated": bool(src.get("contaminated") or tgt.get("contaminated")),
+        "usable": bool(src.get("usable") and tgt.get("usable")),
+        "mode": config.AUDIO_QUALITY_MODE,
+    }
+
+    src_ser_path, tgt_ser_path = source_path, target_path
+    if config.AUDIO_QUALITY_MODE == "filter":
+        src_windows = aq.dominant_windows(src)
+        tgt_windows = aq.dominant_windows(tgt)
+        if src_windows:
+            src_ser_path = aq.cut_windows(source_path, src_windows) or source_path
+        if tgt_windows:
+            tgt_ser_path = aq.cut_windows(target_path, tgt_windows) or target_path
+        report["filtered"] = bool(src_windows or tgt_windows)
+        report["source_windows"] = [[round(a, 2), round(b, 2)] for a, b in src_windows]
+        report["target_windows"] = [[round(a, 2), round(b, 2)] for a, b in tgt_windows]
+    return report, src_ser_path, tgt_ser_path
 
 
 def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2) -> list[dict]:
@@ -829,13 +937,27 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
     t0 = time.perf_counter()
     prepared = []
     for item in items:
-        src_segments = transcribe_segments(item["source_path"])
-        mt_segments = transcribe_segments(item["target_path"])
+        quality = {}
+        src_windows = None
+        tgt_windows = None
+        src_ser_path = item["source_path"]
+        tgt_ser_path = item["target_path"]
+
+        if config.AUDIO_QUALITY_MODE != "off":
+            quality, src_ser_path, tgt_ser_path = _analyse_pair_quality(
+                item["source_path"], item["target_path"],
+            )
+            if config.AUDIO_QUALITY_MODE == "filter":
+                src_windows = quality.get("source_windows")
+                tgt_windows = quality.get("target_windows")
+
+        src_segments = transcribe_segments(item["source_path"], src_windows)
+        mt_segments = transcribe_segments(item["target_path"], tgt_windows)
         pairs, unmatched_src, unmatched_mt = align_segments_by_content(
             src_segments, mt_segments,
             min_similarity=min_similarity, max_merge=max_merge,
         )
-        ser_info = evaluate_ser_pair(item["source_path"], item["target_path"])
+        ser_info = evaluate_ser_pair(src_ser_path, tgt_ser_path)
         prepared.append({
             "pairs": pairs,
             "unmatched_src": unmatched_src,
@@ -843,6 +965,7 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             "src_text": join_segment_text(src_segments),
             "mt_text": join_segment_text(mt_segments),
             "ser_info": ser_info,
+            "audio_quality": quality,
         })
     timings["transcribe_align_s"] = round(time.perf_counter() - t0, 2)
 
@@ -879,6 +1002,7 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             entry["mt_text"],
             timings,
             ser_info=entry["ser_info"],
+            audio_quality=entry.get("audio_quality"),
         ))
         offset += count
 

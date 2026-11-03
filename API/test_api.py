@@ -350,6 +350,34 @@ def main():
               json.dumps(rec.get("error"))[:200])
         check("the stale job is retryable", (rec.get("error") or {}).get("retryable") is True)
 
+        # --------------------------------------------------- audio quality
+        print("\n== audio quality ==")
+        r = client.post("/audio/quality",
+                        files={"audio": ("EN_1.wav", wav(), "audio/wav")},
+                        headers=AUTH)
+        check("POST /audio/quality -> 200", r.status_code == 200, r.text[:250])
+        body = r.json() if r.status_code == 200 else {}
+        check("the quality report has a source section",
+              "source" in body, r.text[:200])
+        check("the quality report has flags", isinstance(body.get("flags"), list),
+              r.text[:200])
+        check("the quality report measures the duration",
+              isinstance(body.get("source", {}).get("duration_s"), (int, float)),
+              r.text[:200])
+        r = client.post("/audio/quality",
+                        files={"audio": ("EN_1.wav", wav(), "audio/wav"),
+                               "target_audio": ("ES_1.wav", wav(), "audio/wav")},
+                        headers=AUTH)
+        check("POST /audio/quality with a target -> 200", r.status_code == 200,
+              r.text[:250])
+        check("the pair report has both sides",
+              "source" in r.json() and "target" in r.json(), r.text[:200])
+        r = client.post("/audio/quality",
+                        files={"audio": ("EN_1.wav", b"not audio", "audio/wav")},
+                        headers=AUTH)
+        check("a corrupt file is rejected, not scored", r.status_code >= 400,
+              r.text[:200])
+
         # ----------------------------------------------------------- openapi
         print("\n== openapi ==")
         r = client.get("/openapi.json")
@@ -357,7 +385,8 @@ def main():
         paths = r.json().get("paths", {})
         for p in ("/health", "/health/ready", "/evaluate", "/jobs", "/evaluations",
                   "/evaluations/{eval_id}", "/evaluations/export", "/metrics",
-                  "/metrics/prometheus", "/translate", "/transcribe"):
+                  "/metrics/prometheus", "/translate", "/transcribe",
+                  "/audio/quality"):
             check(f"openapi documents {p}", p in paths, str(list(paths)))
         check("openapi documents the /api/v1 prefix", "/api/v1/evaluate" in paths,
               str(list(paths)))
