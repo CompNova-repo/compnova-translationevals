@@ -105,6 +105,11 @@ Regenerate with `python3 docs/client-call/tts_unit_economics.py`.
 | Self-hosted TTS on an A6000/A40 48 GB pod ($0.59/hr) at 20× realtime | $0.00049 | — |
 | Self-hosted TTS on the same pod at 50× realtime | $0.00020 | — |
 
+> The self-hosted rows are **estimates**: they assume an open TTS model
+> (Chatterbox, CosyVoice2, Qwen3-TTS) generating audio 20–50× faster than real
+> time on a 48 GB GPU. Measure it on the pod before quoting it. The order of
+> magnitude is what matters: ~150× cheaper than ElevenLabs per minute.
+
 ### Cost of one evaluation job (5-minute files)
 
 | Setup | TTS | scoring | total | TTS share |
@@ -131,6 +136,40 @@ v4, so it wins at the *first* job — there is no volume break-even, only a
 quality/ops trade-off. And the per-minute metered *audio processing* APIs
 (Voice Isolator at $0.12/min) are the ones that would really hurt at scale:
 10,000 hours of audio through that API is ~$72,000/month.
+
+## The bigger lever than price: model licences
+
+While costing this out, one thing turned up that matters more than the API price.
+Several models in the current pipeline are **non-commercial licensed**. Verified
+against the Hugging Face model API, November 2026:
+
+| Model | Where we use it | Licence | Commercial? |
+|---|---|---|---|
+| `Unbabel/wmt22-cometkiwi-da` | **the headline COMET score** (`get_comet()`) | **CC-BY-NC-SA-4.0** | **no** — needs a commercial licence from Unbabel |
+| `Unbabel/wmt22-comet-da` | the reference-based alternative | Apache-2.0 | yes (needs a reference translation) |
+| `facebook/nllb-200-distilled-600M` | cascaded translation | **CC-BY-NC-4.0** | **no** — Meta sells a commercial licence |
+| `facebook/seamless-m4t-v2-large` | the `seamless` translate mode | **CC-BY-NC-4.0** | **no** — same |
+| `google/metricx-24-hybrid-large-v2p6-bfloat16` | MetricX-24 QE | Apache-2.0 | yes |
+| `ehcalabres/wav2vec2-lg-xlsr-en-…-recognition` | SER | Apache-2.0 | yes |
+| `openai/whisper-large-v3-turbo` | ASR | MIT | yes |
+| `pyannote/speaker-diarization-3.1` | the new audio-quality layer | MIT | yes |
+
+If we are selling this as a service, using a non-commercial model to produce a
+commercial score is, on the plain reading of CC-BY-NC, commercial use. This is a
+bigger deal than the difference between ElevenLabs v4 and Flash, and it is the kind
+of thing that surfaces in a client's procurement review rather than on a call.
+
+Options, in order of preference:
+
+1. **Buy the commercial licences** (Unbabel and Meta both sell them) and price them
+   into the cost model — that is a predictable per-unit cost, unlike a metered API.
+2. **Keep MetricX-24 QE (Apache-2.0) as the headline** and treat COMET-Kiwi as
+   optional/ licensed, or switch to `wmt22-comet-da` where a reference exists.
+3. Keep the translation models for demos only and put a commercially licensed
+   backend behind the paid translate endpoint.
+
+> Worth checking with whoever owns the company's legal/commercial side before the
+> next call, not after a contract is signed.
 
 ## The recommendation
 
