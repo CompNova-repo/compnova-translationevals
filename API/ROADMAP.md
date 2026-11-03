@@ -216,6 +216,33 @@ throughput planning, misleading if you try to attribute a slow job.
 `/metrics` keeps the last `EVAL_METRICS_HISTORY` evaluations in a process-local
 deque. It resets on restart and is not shared between workers.
 
+### 2.11 Noisy and multi-speaker audio: measured, not separated
+
+The pipeline now *measures* every recording (SNR, speech ratio, speaker count,
+overlap, background language) and reports it as `audio_quality` - see
+`API/audio_quality.py` and `POST /audio/quality`. What it does **not** do is
+*separate* the target speaker from background voices.
+
+> [!warning] Separation is not on the table for a scoring pipeline
+> Diarization (pyannote) can attribute speech to speakers; it cannot remove a
+> competing voice from the waveform. That needs target-speaker extraction
+> (VoiceFilter / SpeakerBeam class models), which is research-grade, has no
+> dependable cross-language accuracy, and would change the audio being scored.
+> The defensible product answer is to flag contaminated files, and optionally to
+> score only the dominant speaker (`EVAL_AUDIO_QUALITY_MODE=filter`).
+
+Still open inside this area:
+
+* `pyannote/speaker-diarization-3.1` is a **gated** HF model - the pod needs
+  `HF_TOKEN` with the model terms accepted before `speaker_count` is real.
+  Without it the report falls back to energy measurements and
+  `speaker_count` is absent.
+* The `filter` mode currently cuts the dominant speaker's windows and
+  re-transcribes them; it does not yet align speaker labels to Whisper word
+  timestamps, so a chunk that straddles a speaker change can still mix voices.
+* Overlapping speech (two people at once) is measured but not resolved - the
+  score for such a file should be treated as unreliable.
+
 ---
 
 ## 3. Suggested next steps
