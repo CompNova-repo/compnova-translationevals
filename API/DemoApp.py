@@ -20,6 +20,27 @@ DEFAULT_API_URL = os.environ.get("EVAL_API_URL", "http://localhost:8000")
 COMET_FLAG_THRESHOLD = 0.4  # same threshold as run_eval_v3.py
 METRICX_MAX = 25.0          # MetricX shown as 1 - score/25, to match COMET's 0-1 scale
 
+# Names shown to viewers. The underlying models are not named anywhere in the UI.
+SCORE_A = "Model Alpha"     # COMET-Kiwi (0-1, higher is better)
+SCORE_B = "Model Beta"      # MetricX-24 (raw 0-25, lower is better; charted as 1 - score/25)
+DISPLAY_NAMES = {
+    "comet_kiwi": f"{SCORE_A} score",
+    "metricx_24": f"{SCORE_B} score (0-25, lower is better)",
+    "sentiment_agreement_pct": "Sentiment agreement %",
+    "chunks": "Sentence pairs",
+    "unmatched": "Unmatched sentences",
+    "source_sentiment": "Source sentiment",
+    "target_sentiment": "Target sentiment",
+    "sentiment_match": "Sentiment match",
+    "source": "Source",
+    "target": "Target",
+}
+
+
+def display_name(key):
+    key = str(key)
+    return DISPLAY_NAMES.get(key, key.replace("_", " ").capitalize())
+
 st.set_page_config(page_title="S2ST evaluation monitor", layout="wide")
 
 
@@ -83,7 +104,7 @@ def render_summary(summary):
         cols = st.columns(min(len(scalars), 4))
         for i, (key, val) in enumerate(scalars.items()):
             shown = f"{val:.3f}" if isinstance(val, float) else str(val)
-            cols[i % len(cols)].metric(str(key).replace("_", " ").capitalize(), shown)
+            cols[i % len(cols)].metric(display_name(key), shown)
     nested = {k: v for k, v in summary.items() if k not in scalars}
     if nested:
         with st.expander("Other summary fields"):
@@ -113,7 +134,7 @@ def build_score_chart(scores, flagged):
         # Large invisible targets so a click doesn't have to land exactly on a point.
         base.mark_point(size=500, opacity=0.001, cursor="pointer").encode(tooltip=tooltip),
     ]
-    flagged_points = long[(long["metric"] == "COMET-Kiwi") & long["chunk"].isin(flagged)]
+    flagged_points = long[(long["metric"] == SCORE_A) & long["chunk"].isin(flagged)]
     if not flagged_points.empty:
         layers.append(
             alt.Chart(flagged_points)
@@ -136,17 +157,17 @@ def render_interactive_chunks(chart, df, comet_col, flagged):
     for i, row in df.iterrows():
         label = f"Chunk {i}"
         if comet_col:
-            label += f", COMET {row[comet_col]:.3f}"
+            label += f", {SCORE_A} {row[comet_col]:.3f}"
         if i in flagged:
             label += ", below threshold"
         # Transcript text comes from audio we don't control, so it is always escaped.
         fields = "".join(
-            f"<div class='field'><div class='name'>{html.escape(str(c))}</div>"
+            f"<div class='field'><div class='name'>{html.escape(display_name(c))}</div>"
             f"<div>{html.escape(str(row[c]))}</div></div>"
             for c in text_cols
         )
         nums = ", ".join(
-            f"{c}: {row[c]:.3f}" if isinstance(row[c], float) else f"{c}: {row[c]}"
+            f"{display_name(c)}: {row[c]:.3f}" if isinstance(row[c], float) else f"{display_name(c)}: {row[c]}"
             for c in num_cols
         )
         css_class = "flag" if i in flagged else ""
@@ -218,36 +239,38 @@ def render_chunks(chunks):
 
     scores = pd.DataFrame(index=df.index)
     if comet_col:
-        scores["COMET-Kiwi"] = df[comet_col]
+        scores[SCORE_A] = df[comet_col]
     if mx_norm_col:
-        scores["MetricX (normalised)"] = df[mx_norm_col]
+        scores[f"{SCORE_B} (normalised)"] = df[mx_norm_col]
     elif mx_raw_col:
-        scores["MetricX (normalised)"] = (1 - df[mx_raw_col] / METRICX_MAX).clip(0, 1)
+        scores[f"{SCORE_B} (normalised)"] = (1 - df[mx_raw_col] / METRICX_MAX).clip(0, 1)
 
     flagged = []
     if comet_col:
         flagged = df.index[df[comet_col] < COMET_FLAG_THRESHOLD].tolist()
         if flagged:
             st.warning(
-                f"{len(flagged)} chunk(s) scored below COMET {COMET_FLAG_THRESHOLD}: "
+                f"{len(flagged)} sentence pair(s) scored below {SCORE_A} {COMET_FLAG_THRESHOLD}: "
                 + ", ".join(map(str, flagged))
             )
         else:
-            st.success(f"No chunks scored below COMET {COMET_FLAG_THRESHOLD}.")
+            st.success(f"No sentence pairs scored below {SCORE_A} {COMET_FLAG_THRESHOLD}.")
 
     if len(scores.columns):
         render_interactive_chunks(build_score_chart(scores, flagged), df, comet_col, flagged)
     else:
-        st.caption("No COMET or MetricX columns found in the chunk data, so there is no chart.")
+        st.caption("No score columns found in the result, so there is no chart.")
 
-    with st.expander("All chunks as a table"):
+    with st.expander("All sentence pairs as a table"):
+        shown = df.rename(columns=display_name)
         if comet_col:
+            flag_col = display_name(comet_col)
             def highlight(row):
-                bad = row[comet_col] < COMET_FLAG_THRESHOLD
+                bad = row[flag_col] < COMET_FLAG_THRESHOLD
                 return ["background-color: rgba(255, 75, 75, 0.18)" if bad else ""] * len(row)
-            st.dataframe(df.style.apply(highlight, axis=1).format(precision=3))
+            st.dataframe(shown.style.apply(highlight, axis=1).format(precision=3))
         else:
-            st.dataframe(df)
+            st.dataframe(shown)
 
 
 def render_transcripts(transcripts, eval_id):
@@ -337,5 +360,3 @@ render_chunks(result.get("chunks"))
 render_transcripts(result.get("transcripts"), record["id"])
 render_unmatched(result.get("unmatched"))
 
-with st.expander("Raw JSON"):
-    st.json(record)
