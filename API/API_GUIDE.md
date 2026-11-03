@@ -115,6 +115,13 @@ Everything is read from the environment once, at import time — see `config.py`
 | `EVAL_SER_ENABLED` | `1` | Speech Emotion Recognition. The checkpoint is **English-only** — see the warning at the top. |
 | `EVAL_SER_MODEL_LANGUAGE` | `en` | The language the SER checkpoint was trained on. Reported by `/health/ready`. |
 | `EVAL_AUTO_RESAMPLE_16K` | `1` | Resample uploads to 16 kHz mono instead of rejecting them. |
+| `EVAL_AUDIO_QUALITY_MODE` | `off` | `off` · `flag` (report noise/speaker/overlap flags with every result) · `filter` (also score only the dominant speaker). See §6.16. |
+| `EVAL_AUDIO_QUALITY_DIARIZATION` | `1` | Use pyannote diarization when it is installed. |
+| `EVAL_AUDIO_QUALITY_LANGUAGE_ID` | `1` | Use Whisper for language identification of the background speech. |
+| `EVAL_AUDIO_QUALITY_SNR_FLOOR_DB` | `10.0` | Below this SNR the recording is flagged `noisy`. |
+| `EVAL_AUDIO_QUALITY_MIN_SPEECH_RATIO` | `0.10` | Below this share of speech the recording is flagged `mostly_silence`. |
+| `EVAL_AUDIO_QUALITY_MAX_DOMINANT_RATIO` | `0.75` | Below this talk-time share no speaker dominates, so the file is flagged. |
+| `EVAL_AUDIO_QUALITY_MAX_OVERLAP_RATIO` | `0.15` | Above this share of the file, the recording is flagged `overlapping_speech`. |
 | `EVAL_EXPECTED_SAMPLE_RATE` | `16000` | The sample rate the pipeline expects. |
 | `EVAL_EXPECTED_CHANNELS` | `1` | The channel count the pipeline expects. |
 | `EVAL_MIN_FREE_DISK_MB` | `2048` | Refuse uploads below this much free space (`INSUFFICIENT_DISK`). |
@@ -313,6 +320,11 @@ curl -s -X POST "$BASE/translate?response=audio" \
 > gTTS (used by the cascaded path) needs outbound internet access to Google's TTS
 > endpoint. On a RunPod pod that works; on an air-gapped host use `mode=seamless`,
 > which is fully local.
+>
+> **Cost control:** synthesised speech is cached by (language, text) under
+> `EVAL_TTS_CACHE_DIR`, so a repeated translation is free and deterministic.
+> Speech APIs bill per *generation request*, not per download, so without the
+> cache every re-run of the pipeline re-pays for the same audio.
 
 ### 6.6 `POST /evaluate`
 
@@ -394,6 +406,14 @@ Evaluate a source/target pair end to end and wait for the result.
     "comet_s": 8.0,
     "metricx_s": 41.2,
     "sentiment_s": 1.3
+  },
+  "audio_quality": {
+    "source": {"snr_db": 18.2, "speaker_count": 2, "flags": ["multi_speaker"]},
+    "target": {"snr_db": 31.0, "speaker_count": 1, "flags": []},
+    "flags": ["multi_speaker"],
+    "contaminated": true,
+    "usable": true,
+    "mode": "flag"
   }
 }
 ```
@@ -576,7 +596,88 @@ spreadsheet or a BI tool. `jsonl` has the full records.
 Delete one evaluation, or every evaluation created before a timestamp. `prune` is how
 you implement a retention policy.
 
-### 6.16 Endpoint summary
+### 6.16 `POST /audio/quality`
+
+Measure a recording **before** it is evaluated. This is the answer to "what if the
+file has background noise and other people talking in the background?" - you do not
+silently score a contaminated file, you find out that it is contaminated.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `audio` | yes | The recording to inspect. |
+| `target_audio` | no | A second file, analysed the same way (pair report). |
+
+```bash
+curl -s -X POST "$BASE/audio/quality" -F "audio=@/data/EN_001.wav"
+```
+
+```json
+{
+  "source": {
+    "duration_s": 63.4,
+    "snr_db": 18.2,
+    "noise_floor_db": -46.1,
+    "speech_level_db": -27.9,
+    "speech_ratio": 0.71,
+    "speech_s": 45.0,
+    "speaker_count": 2,
+    "dominant_speaker_ratio": 0.83,
+    "overlap_ratio": 0.06,
+    "overlap_s": 2.7,
+    "languages": ["eng"],
+    "background_languages": ["spa"],
+    "background_speech_detected": true,
+    "detector": "diarization",
+    "flags": ["multi_speaker", "background_speech"],
+    "usable": true,
+    "contaminated": true
+  },
+  "flags": ["multi_speaker", "background_speech"],
+  "contaminated": true,
+  "usable": true
+}
+```
+
+**Flags**
+
+| Flag | Meaning |
+|---|---|
+| `noisy` | Signal-to-noise ratio below `EVAL_AUDIO_QUALITY_SNR_FLOOR_DB` (default 10 dB). |
+| `mostly_silence` | Less than `EVAL_AUDIO_QUALITY_MIN_SPEECH_RATIO` (default 10%) of the file is speech. |
+| `multi_speaker` | More than one speaker was detected. |
+| `no_single_dominant_speaker` | No speaker owns enough of the speech (default: less than 75% of the talk time). |
+| `overlapping_speech` | More than 15% of the file has two people talking at once. |
+| `background_speech` | Speech other than the dominant speaker was detected. |
+| `very_short_speech` | Less than one second of speech - the scores will be unstable. |
+
+**How the evaluation pipeline uses it**
+
+`EVAL_AUDIO_QUALITY_MODE` controls what happens during `POST /evaluate` and
+`POST /jobs`:
+
+| Mode | Behaviour |
+|---|---|
+| `off` (default) | No analysis. The behaviour of 2.1 is unchanged. |
+| `flag` | Every result carries an `audio_quality` block and the flags. The score itself is unchanged - nothing is hidden. |
+| `filter` | The transcript and the emotion model only see the dominant speaker's words, so a background voice in another language cannot contaminate the score. |
+
+```json
+"audio_quality": {
+  "source": {"...": "..."},
+  "target": {"...": "..."},
+  "flags": ["multi_speaker", "background_speech"],
+  "contaminated": true,
+  "usable": true,
+  "mode": "flag"
+}
+```
+
+The analysis needs no model of its own to run: the core measurements are NumPy.
+Diarization (pyannote) and language identification (Whisper) improve the report when
+they are installed - see `EVAL_AUDIO_QUALITY_DIARIZATION` and
+`EVAL_AUDIO_QUALITY_LANGUAGE_ID`.
+
+### 6.17 Endpoint summary
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -593,6 +694,7 @@ you implement a retention policy.
 | `GET` | `/evaluations` · `/evaluations/latest` · `/evaluations/{id}` | yes | Read results |
 | `GET` | `/evaluations/export` | yes | Export |
 | `DELETE` | `/evaluations/{id}` · `POST /evaluations/prune` | yes | Retention |
+| `POST` | `/audio/quality` | yes | Measure a recording before scoring it |
 
 ---
 

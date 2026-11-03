@@ -30,6 +30,7 @@ os.environ["USE_TF"] = "NO"
 os.environ["USE_JAX"] = "NO"
 
 import functools
+import hashlib
 import json
 import logging
 import struct
@@ -569,14 +570,22 @@ def evaluate_ser_pair(src_path: str, mt_path: str) -> dict:
 # transcription
 # --------------------------------------------------------------------------- #
 
-def transcribe_segments(filepath: str) -> list[str]:
+def transcribe_segments(filepath: str, windows=None) -> list[str]:
+    """Transcribe an audio file.
+
+    `windows` is an optional list of (start, end) seconds. When given, only
+    those parts of the file are transcribed - used by the audio-quality
+    filter to score the dominant speaker only.
+    """
     whisper_model = get_whisper()
-    segments, _info = whisper_model.transcribe(
-        filepath,
+    kwargs = dict(
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
     )
+    if windows:
+        kwargs["clip_timestamps"] = [(float(a), float(b)) for a, b in windows]
+    segments, _info = whisper_model.transcribe(filepath, **kwargs)
     return [seg.text.strip() for seg in segments if seg.text.strip()]
 
 
@@ -763,8 +772,10 @@ def sentiment_batch(texts):
 # --------------------------------------------------------------------------- #
 
 def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
-              src_sent, mt_sent, src_text, mt_text, timings, ser_info=None) -> dict:
+              src_sent, mt_sent, src_text, mt_text, timings, ser_info=None,
+              audio_quality=None) -> dict:
     ser_info = ser_info or {}
+    audio_quality = audio_quality or {}
     chunks = []
     sentiment_matches = []
     for idx, p in enumerate(pairs):
@@ -811,10 +822,174 @@ def _assemble(pairs, unmatched_src, unmatched_mt, comet_scores, metricx_scores,
             "target_emotion_top1": tgt_emotion_top1,
         },
         "ser": ser_info,
+        "audio_quality": audio_quality,
         "chunks": chunks,
         "unmatched": {"source": unmatched_src, "target": unmatched_mt},
         "timings": timings,
     }
+
+
+# --------------------------------------------------------------------------- #
+# audio quality (noise / multiple speakers / overlapping speech)
+# --------------------------------------------------------------------------- #
+
+def analyse_audio_quality(path: str, target_path: str | None = None) -> dict:
+    """Public entry point: measure a recording before it is evaluated.
+
+    Always runs the analysis, whatever EVAL_AUDIO_QUALITY_MODE is set to -
+    the mode only controls what the *evaluation* pipeline does with the
+    result. Returns the noise / speaker / overlap report.
+    """
+    try:
+        import audio_quality as aq
+    except Exception as exc:  # pragma: no cover - import guard
+        raise RuntimeError(f"audio quality analysis unavailable: {exc}") from exc
+
+    kwargs = dict(
+        snr_floor_db=config.AUDIO_QUALITY_SNR_FLOOR_DB,
+        min_speech_ratio=config.AUDIO_QUALITY_MIN_SPEECH_RATIO,
+        max_dominant_ratio=config.AUDIO_QUALITY_MAX_DOMINANT_RATIO,
+        max_overlap_ratio=config.AUDIO_QUALITY_MAX_OVERLAP_RATIO,
+        use_diarization=config.AUDIO_QUALITY_DIARIZATION,
+        use_language_id=config.AUDIO_QUALITY_LANGUAGE_ID,
+    )
+
+    src = aq.analyze(path, **kwargs)
+    report = {
+        "source": aq.public(src),
+        "flags": list(src.get("flags", [])),
+        "contaminated": bool(src.get("contaminated")),
+        "usable": bool(src.get("usable")),
+    }
+    if target_path:
+        tgt = aq.analyze(target_path, **kwargs)
+        report["target"] = aq.public(tgt)
+        report["flags"] = sorted(set(report["flags"]) | set(tgt.get("flags", [])))
+        report["contaminated"] = bool(src.get("contaminated") or tgt.get("contaminated"))
+        report["usable"] = bool(src.get("usable") and tgt.get("usable"))
+    return report
+
+
+def transcribe_speaker_filtered(filepath: str, windows=None,
+                                 exclusive_turns=None, dominant: str | None = None,
+                                 ) -> list[str]:
+    """Transcribe and keep only the dominant speaker's words.
+
+    Whisper gives word timestamps; the diarization turns (in their
+    *exclusive*, non-overlapping form) give the speaker of every moment.
+    Words that belong to somebody else are dropped, so a background voice in
+    another language never reaches the transcript - not even inside a
+    sentence that starts with the target speaker.
+
+    A segment whose words are all the target speaker's is kept verbatim; only
+    a genuinely mixed segment is rebuilt from the surviving words.
+    """
+    whisper_model = get_whisper()
+    kwargs = dict(
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        word_timestamps=True,
+    )
+    if windows:
+        kwargs["clip_timestamps"] = [(float(a), float(b)) for a, b in windows]
+    segments, _info = whisper_model.transcribe(filepath, **kwargs)
+
+    try:
+        import audio_quality as aq
+    except Exception:  # pragma: no cover - import guard
+        aq = None
+
+    out: list[str] = []
+    for seg in segments:
+        text = (getattr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+        words = [w for w in (getattr(seg, "words", None) or [])
+                 if getattr(w, "start", None) is not None
+                 and getattr(w, "end", None) is not None]
+        if not words or not exclusive_turns or not dominant or aq is None:
+            out.append(text)
+            continue
+        labels = [aq.speaker_of(w.start, w.end, exclusive_turns) for w in words]
+        if all(label is None or label == dominant for label in labels):
+            out.append(text)
+            continue
+        kept = aq.keep_dominant_words(
+            [(w.start, w.end, (w.word or "").strip()) for w in words],
+            exclusive_turns, dominant,
+        )
+        kept_text = " ".join(text for _s, _e, text in kept).strip()
+        if kept_text:
+            out.append(kept_text)
+    return out
+
+
+def _analyse_pair_quality(source_path: str, target_path: str):
+    """Measure both recordings and decide which audio to score.
+
+    Returns (report, source_path_for_ser, target_path_for_ser, speakers).
+
+    * mode "flag"   - the report describes the noise / speakers / overlap; the
+      score is still computed on the full recording (nothing is hidden).
+    * mode "filter" - the transcription and the SER model only see the
+      dominant speaker's windows, so background voices in another language
+      cannot contaminate the score.
+    """
+    try:
+        import audio_quality as aq
+    except Exception as exc:  # pragma: no cover - import guard
+        LOG.warning("audio_quality module unavailable: %s", exc)
+        return {}, source_path, target_path, {}
+
+    kwargs = dict(
+        snr_floor_db=config.AUDIO_QUALITY_SNR_FLOOR_DB,
+        min_speech_ratio=config.AUDIO_QUALITY_MIN_SPEECH_RATIO,
+        max_dominant_ratio=config.AUDIO_QUALITY_MAX_DOMINANT_RATIO,
+        max_overlap_ratio=config.AUDIO_QUALITY_MAX_OVERLAP_RATIO,
+        use_diarization=config.AUDIO_QUALITY_DIARIZATION,
+        use_language_id=config.AUDIO_QUALITY_LANGUAGE_ID,
+    )
+
+    try:
+        src = aq.analyze(source_path, **kwargs)
+        tgt = aq.analyze(target_path, **kwargs)
+    except Exception as exc:
+        LOG.warning("audio quality analysis failed: %s", exc)
+        return {}, source_path, target_path, {}
+
+    report = {
+        "source": aq.public(src),
+        "target": aq.public(tgt),
+        "flags": sorted(set(src.get("flags", [])) | set(tgt.get("flags", []))),
+        "contaminated": bool(src.get("contaminated") or tgt.get("contaminated")),
+        "usable": bool(src.get("usable") and tgt.get("usable")),
+        "mode": config.AUDIO_QUALITY_MODE,
+    }
+
+    speakers = {
+        "source": {
+            "exclusive": aq.exclusive_turns(src),
+            "dominant": src.get("dominant_speaker"),
+        },
+        "target": {
+            "exclusive": aq.exclusive_turns(tgt),
+            "dominant": tgt.get("dominant_speaker"),
+        },
+    }
+
+    src_ser_path, tgt_ser_path = source_path, target_path
+    if config.AUDIO_QUALITY_MODE == "filter":
+        src_windows = aq.dominant_windows(src)
+        tgt_windows = aq.dominant_windows(tgt)
+        if src_windows:
+            src_ser_path = aq.cut_windows(source_path, src_windows) or source_path
+        if tgt_windows:
+            tgt_ser_path = aq.cut_windows(target_path, tgt_windows) or target_path
+        report["filtered"] = bool(src_windows or tgt_windows)
+        report["source_windows"] = [[round(a, 2), round(b, 2)] for a, b in src_windows]
+        report["target_windows"] = [[round(a, 2), round(b, 2)] for a, b in tgt_windows]
+    return report, src_ser_path, tgt_ser_path, speakers
 
 
 def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2) -> list[dict]:
@@ -829,13 +1004,40 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
     t0 = time.perf_counter()
     prepared = []
     for item in items:
-        src_segments = transcribe_segments(item["source_path"])
-        mt_segments = transcribe_segments(item["target_path"])
+        quality = {}
+        src_windows = None
+        tgt_windows = None
+        speakers = {}
+        src_ser_path = item["source_path"]
+        tgt_ser_path = item["target_path"]
+
+        if config.AUDIO_QUALITY_MODE != "off":
+            quality, src_ser_path, tgt_ser_path, speakers = _analyse_pair_quality(
+                item["source_path"], item["target_path"],
+            )
+            if config.AUDIO_QUALITY_MODE == "filter":
+                src_windows = quality.get("source_windows")
+                tgt_windows = quality.get("target_windows")
+
+        if config.AUDIO_QUALITY_MODE == "filter" and speakers:
+            src_segments = transcribe_speaker_filtered(
+                item["source_path"], src_windows,
+                speakers.get("source", {}).get("exclusive"),
+                speakers.get("source", {}).get("dominant"),
+            )
+            mt_segments = transcribe_speaker_filtered(
+                item["target_path"], tgt_windows,
+                speakers.get("target", {}).get("exclusive"),
+                speakers.get("target", {}).get("dominant"),
+            )
+        else:
+            src_segments = transcribe_segments(item["source_path"], src_windows)
+            mt_segments = transcribe_segments(item["target_path"], tgt_windows)
         pairs, unmatched_src, unmatched_mt = align_segments_by_content(
             src_segments, mt_segments,
             min_similarity=min_similarity, max_merge=max_merge,
         )
-        ser_info = evaluate_ser_pair(item["source_path"], item["target_path"])
+        ser_info = evaluate_ser_pair(src_ser_path, tgt_ser_path)
         prepared.append({
             "pairs": pairs,
             "unmatched_src": unmatched_src,
@@ -843,6 +1045,7 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             "src_text": join_segment_text(src_segments),
             "mt_text": join_segment_text(mt_segments),
             "ser_info": ser_info,
+            "audio_quality": quality,
         })
     timings["transcribe_align_s"] = round(time.perf_counter() - t0, 2)
 
@@ -879,6 +1082,7 @@ def evaluate_pairs_batch(items, min_similarity: float = 0.5, max_merge: int = 2)
             entry["mt_text"],
             timings,
             ser_info=entry["ser_info"],
+            audio_quality=entry.get("audio_quality"),
         ))
         offset += count
 
@@ -927,12 +1131,37 @@ def translate_text(source_text: str, target_lang: str) -> str:
 
 
 def synthesize_speech(text: str, target_lang: str) -> str:
-    """Synthesise speech with gTTS. Returns the path to an mp3 file."""
+    """Synthesise speech, with a content-addressed cache.
+
+    Speech APIs bill per *generation request*, not per download, so a pipeline
+    that re-synthesises on every run pays for the same audio over and over.
+    The cache is keyed on (language, text), so a repeated translation is free
+    and deterministic - and it is the single biggest TTS cost control we have.
+
+    Returns the path to an mp3 file. Cached files live in
+    `EVAL_TTS_CACHE_DIR` and must not be deleted by the caller.
+    """
     from gtts import gTTS
 
     tts_lang = TTS_LANG_MAP.get(normalise_language(target_lang), "en")
+    try:
+        os.makedirs(config.TTS_CACHE_DIR, exist_ok=True)
+        digest = hashlib.sha256(f"{tts_lang}|{text}".encode("utf-8")).hexdigest()[:24]
+        cached = os.path.join(config.TTS_CACHE_DIR, f"tts_{digest}.mp3")
+        if os.path.exists(cached) and os.path.getsize(cached) > 0:
+            return cached
+    except OSError as exc:
+        LOG.warning("TTS cache unavailable (%s) - synthesising directly", exc)
+        cached = None
+
     out = f"/tmp/compnova_tts_{uuid.uuid4().hex[:12]}.mp3"
     gTTS(text=text, lang=tts_lang).save(out)
+    if cached:
+        try:
+            os.replace(out, cached)   # atomic publish
+            return cached
+        except OSError as exc:
+            LOG.warning("could not publish TTS cache entry (%s)", exc)
     return out
 
 
@@ -1000,7 +1229,8 @@ def translate_audio(source_path: str, target_lang: str, mode: str = "cascaded") 
     translated = translate_text(source_text, target)
     mp3_path = synthesize_speech(translated, target)
     wav_path = _to_wav_16k(mp3_path)
-    if wav_path != mp3_path:
+    if wav_path != mp3_path and not mp3_path.startswith(config.TTS_CACHE_DIR):
+        # cached entries are reused, so they must not be deleted
         try:
             os.remove(mp3_path)
         except OSError:

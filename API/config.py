@@ -8,6 +8,7 @@ RunPod setup script relies on.
 """
 import os
 import shutil
+import tempfile
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -138,7 +139,43 @@ SER_ENABLED = _env_bool("EVAL_SER_ENABLED", True)
 # a client can tell whether ser_match_score is meaningful for its pair.
 SER_MODEL_LANGUAGE = os.environ.get("EVAL_SER_MODEL_LANGUAGE", "en")
 
+# ------------------------------------------------------------ audio quality --
+# How the pipeline treats recordings that contain background noise, more than
+# one speaker, or overlapping speech (a second voice in the background, in
+# another language). This is a *scoring* pipeline, so the default is to report
+# the problem rather than silently rewrite the audio:
+#
+#   "off"    - no analysis (old behaviour).
+#   "flag"   - analyse every file and report noise / speaker-count / overlap
+#              flags next to the score. The score itself is unchanged.
+#   "filter" - additionally transcribe only the dominant speaker, so the score
+#              is computed on the intended speech.
+#
+# See API/audio_quality.py for the measurement details and API/ROADMAP.md.
+AUDIO_QUALITY_MODE = os.environ.get("EVAL_AUDIO_QUALITY_MODE", "off").strip().lower()
+if AUDIO_QUALITY_MODE not in ("off", "flag", "filter"):
+    AUDIO_QUALITY_MODE = "off"
+
+# Diarization (pyannote) and language identification (Whisper) are optional
+# accelerators. When they are not installed the analysis still runs, using
+# energy-based measurements only.
+AUDIO_QUALITY_DIARIZATION = _env_bool("EVAL_AUDIO_QUALITY_DIARIZATION", True)
+AUDIO_QUALITY_LANGUAGE_ID = _env_bool("EVAL_AUDIO_QUALITY_LANGUAGE_ID", True)
+
+# Measurement thresholds. See audio_quality.py for the defaults.
+AUDIO_QUALITY_SNR_FLOOR_DB = _env_float("EVAL_AUDIO_QUALITY_SNR_FLOOR_DB", 10.0)
+AUDIO_QUALITY_MIN_SPEECH_RATIO = _env_float("EVAL_AUDIO_QUALITY_MIN_SPEECH_RATIO", 0.10)
+AUDIO_QUALITY_MAX_DOMINANT_RATIO = _env_float("EVAL_AUDIO_QUALITY_MAX_DOMINANT_RATIO", 0.75)
+AUDIO_QUALITY_MAX_OVERLAP_RATIO = _env_float("EVAL_AUDIO_QUALITY_MAX_OVERLAP_RATIO", 0.15)
+
 # -------------------------------------------------------------- translation --
+
+# Where synthesised speech is cached, keyed on (language, text). Speech APIs
+# bill per generation request, so re-synthesising on every run is the single
+# biggest waste in a TTS pipeline.
+TTS_CACHE_DIR = os.environ.get("EVAL_TTS_CACHE_DIR", "").strip() or os.path.join(
+    tempfile.gettempdir(), "compnova_tts_cache",
+)
 
 # The translation models (NLLB-200, SeamlessM4T) are only loaded when
 # /translate is actually called, so a deployment that only evaluates never
@@ -222,6 +259,9 @@ def describe() -> dict:
         "auto_resample_16k": AUTO_RESAMPLE_16K,
         "ser_enabled": SER_ENABLED,
         "ser_model_language": SER_MODEL_LANGUAGE,
+        "audio_quality_mode": AUDIO_QUALITY_MODE,
+        "audio_quality_diarization": AUDIO_QUALITY_DIARIZATION,
+        "audio_quality_language_id": AUDIO_QUALITY_LANGUAGE_ID,
         "translate_enabled": TRANSLATE_ENABLED,
         "metricx_dir": METRICX_PATH,
         "retention_days": RETENTION_DAYS,

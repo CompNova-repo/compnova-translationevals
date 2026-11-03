@@ -725,6 +725,40 @@ def transcribe(
             os.remove(path)
 
 
+@router.post("/audio/quality")
+def audio_quality(
+    audio: UploadFile = File(..., description="Audio to inspect (WAV/MP3)"),
+    target_audio: Optional[UploadFile] = File(
+        None, description="Optional target audio, analysed the same way"),
+    x_api_key: Optional[str] = Header(default=None),
+    _auth: None = Depends(require_api_key),
+):
+    """Measure a recording before it is evaluated.
+
+    Reports the signal-to-noise ratio, how much of the file is speech, how
+    many speakers there are, how much of the audio is overlapping speech and
+    which languages are present - plus a `flags` list (`noisy`,
+    `multi_speaker`, `overlapping_speech`, `background_speech`, ...).
+
+    This is the "can I score this file?" check: a contaminated recording is
+    reported as such instead of silently producing a wrong score.
+    """
+    path = None
+    target_path = None
+    try:
+        path = _save_upload(audio, "audio")
+        if target_audio is not None:
+            target_path = _save_upload(target_audio, "target_audio")
+        return eval_core.analyse_audio_quality(path, target_path)
+    finally:
+        for p in (path, target_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
 @router.post("/translate")
 def translate(
     source_audio: UploadFile = File(..., description="Source-language audio"),

@@ -216,6 +216,65 @@ throughput planning, misleading if you try to attribute a slow job.
 `/metrics` keeps the last `EVAL_METRICS_HISTORY` evaluations in a process-local
 deque. It resets on restart and is not shared between workers.
 
+### 2.11 Noisy and multi-speaker audio: measured, not separated
+
+The pipeline now *measures* every recording (SNR, speech ratio, speaker count,
+overlap, background language) and reports it as `audio_quality` - see
+`API/audio_quality.py` and `POST /audio/quality`. What it does **not** do is
+*separate* the target speaker from background voices.
+
+> [!warning] Separation is not on the table for a scoring pipeline
+> Diarization (pyannote) can attribute speech to speakers; it cannot remove a
+> competing voice from the waveform. That needs target-speaker extraction
+> (VoiceFilter / SpeakerBeam class models), which is research-grade, has no
+> dependable cross-language accuracy, and would change the audio being scored.
+> The defensible product answer is to flag contaminated files, and optionally to
+> score only the dominant speaker (`EVAL_AUDIO_QUALITY_MODE=filter`).
+
+Still open inside this area:
+
+* `pyannote/speaker-diarization-3.1` is a **gated** HF model - the pod needs
+  `HF_TOKEN` with the model terms accepted before `speaker_count` is real.
+  Without it the report falls back to energy measurements and
+  `speaker_count` is absent.
+* Word-level speaker attribution needs pyannote **4.x**, which returns the
+  `exclusive_speaker_diarization` annotation (the same diarization without
+  overlapping segments, so a word maps to exactly one speaker). On pyannote 3.1
+  the overlapping turns are used and a word can be mis-attributed while two
+  people talk at once.
+* The `filter` mode needs a measurement of its own: NIST SRE24 found that
+  top-ranked systems often avoided diarization because it *degraded* recognition.
+  Measure end-to-end WER with and before enabling it for a customer.
+* Overlapping speech (two people at once) is measured but not resolved - the
+  score for such a file should be treated as unreliable.
+* The accuracy upgrade is `nvidia/Nemotron-3-Diarization` (OpenMDW-1.1,
+  commercial use OK): DER 12.73 on DIHARD3-full vs 19.09, and roughly an order
+  of magnitude faster. It needs `nemo-toolkit`. Note that the older
+  `nvidia/diar_sortformer_4spk-v1` is **CC-BY-NC-4.0** and cannot ship in a
+  paid product.
+
+### 2.12 The speech engine is gTTS, and that should not ship
+
+The cascaded translate path synthesises with **gTTS**, which calls Google's
+*unofficial* endpoint: free, low quality, rate-limited, and not something a paid
+product should depend on. Replacing it is a cost *and* a quality decision, and
+the price list is in `docs/client-call/02-speech-costs.md`:
+
+| Option | $/1M chars | Note |
+|---|---|---|
+| ElevenLabs v4 / Turbo | $80 / $40 | best quality (Elo 1334); v4 Turbo is the same quality at half the price |
+| Azure Neural, AWS Polly Neural, Google Neural2 | $15–16 | 5.3× cheaper than ElevenLabs, zero ops |
+| Self-hosted Qwen3-TTS / CosyVoice2 / Chatterbox | ~$0.7–5 | Apache-2.0 / MIT, ~700× cheaper per minute, but ~$3,000/month fixed |
+
+**What is already done:** synthesised speech is cached by (language, text)
+(`EVAL_TTS_CACHE_DIR`), so a repeated translation is free and deterministic —
+speech APIs bill per *generation request*, not per download, so without the cache
+every re-run re-pays for the same audio.
+
+**Still open:** which engine, and whether the target audio we synthesise is even
+the right thing to score. Note that scoring our own TTS output with COMET is
+circular — the client should send the target audio their own engine produced.
+
 ---
 
 ## 3. Suggested next steps
