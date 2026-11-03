@@ -253,6 +253,28 @@ Still open inside this area:
   `nvidia/diar_sortformer_4spk-v1` is **CC-BY-NC-4.0** and cannot ship in a
   paid product.
 
+### 2.12 The speech engine is gTTS, and that should not ship
+
+The cascaded translate path synthesises with **gTTS**, which calls Google's
+*unofficial* endpoint: free, low quality, rate-limited, and not something a paid
+product should depend on. Replacing it is a cost *and* a quality decision, and
+the price list is in `docs/client-call/02-speech-costs.md`:
+
+| Option | $/1M chars | Note |
+|---|---|---|
+| ElevenLabs v4 / Turbo | $80 / $40 | best quality (Elo 1334); v4 Turbo is the same quality at half the price |
+| Azure Neural, AWS Polly Neural, Google Neural2 | $15–16 | 5.3× cheaper than ElevenLabs, zero ops |
+| Self-hosted Qwen3-TTS / CosyVoice2 / Chatterbox | ~$0.7–5 | Apache-2.0 / MIT, ~700× cheaper per minute, but ~$3,000/month fixed |
+
+**What is already done:** synthesised speech is cached by (language, text)
+(`EVAL_TTS_CACHE_DIR`), so a repeated translation is free and deterministic —
+speech APIs bill per *generation request*, not per download, so without the cache
+every re-run re-pays for the same audio.
+
+**Still open:** which engine, and whether the target audio we synthesise is even
+the right thing to score. Note that scoring our own TTS output with COMET is
+circular — the client should send the target audio their own engine produced.
+
 ---
 
 ## 3. Suggested next steps

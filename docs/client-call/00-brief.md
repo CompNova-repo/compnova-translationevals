@@ -65,20 +65,34 @@ She is right about the *shape* of the cost, and the cost is not where she thinks
 
 | | |
 |---|---|
-| ElevenLabs TTS v4 | **$0.08 / 1k chars** ≈ $0.072 per minute of audio ($4.80/hour) |
-| ElevenLabs Flash/Turbo | $0.04 / 1k chars ≈ $0.036 per minute |
+| ElevenLabs TTS v4 | **$0.08 / 1k chars** = $0.08 per minute of audio ($4.80/hour) |
+| ElevenLabs v4 Turbo | $0.04 / 1k chars — **same Elo as v4 (1331 vs 1334), half the price** |
 | ElevenLabs **Voice Isolator** (noise removal) | **$0.12 / minute** = $7.20 per hour of audio |
-| ElevenLabs plans | Free → Starter $6 → Creator $22 → Pro $99 → Scale $299 → **Business $990**; credits do not roll over |
-| Our GPU | RTX A6000 48 GB **$0.59/hour** on RunPod (A100 80 GB $1.79) |
+| Azure Neural / Polly Neural / Google Neural2 | $15–16 per 1M chars = **5.3× cheaper than ElevenLabs** |
+| ElevenLabs plans | Free → Starter $6 → Creator $22 → Pro $99 → Scale $299 → **Business $990**; credits do not roll over; **API tiers are prepaid list price, only Enterprise discounts** |
+| Our GPU | RTX A6000 48 GB **$0.33/hour** on RunPod community cloud (A100 80 GB $1.39) |
 
 **Per 5-minute evaluation job (63 s of GPU time):**
 
 | Setup | TTS | scoring | total |
 |---|---|---|---|
-| ElevenLabs v4 | $0.360 | $0.010 | **$0.370** ← TTS is 97% of the bill |
+| ElevenLabs v4 | $0.400 | $0.010 | **$0.410** ← TTS is 97% of the bill |
+| Azure Neural | $0.075 | $0.010 | $0.085 |
 | Self-hosted TTS on the pod we already rent | $0.001 | $0.010 | **$0.011** |
 
-**10,000 jobs/month:** $3,703 with ElevenLabs v4 vs **$113** self-hosted.
+**10,000 jobs/month:** $4,058 with ElevenLabs v4 vs **$3,268** self-hosted (incl. $3,015
+fixed) — but self-hosting only overtakes a *cheap hosted API* at ~40,000 jobs/month,
+so below that, switch to Azure and keep zero ops.
+
+### The fourth point — the one that actually costs money
+
+ElevenLabs charges **per generation request, not per download**. So every re-run of
+the pipeline re-bills the whole corpus: at 100k jobs/month one re-run is **$40,000**.
+The fix is a content-addressed cache keyed on (target_text, voice, model, params,
+seed) — typically 50–90% of TTS spend removed, and worth doing before switching
+vendors. **We have already built it**: the cascaded translate path now caches
+synthesised speech by (language, text), so a repeated translation is free and
+deterministic.
 
 ### The three points that land
 

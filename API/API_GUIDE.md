@@ -320,6 +320,11 @@ curl -s -X POST "$BASE/translate?response=audio" \
 > gTTS (used by the cascaded path) needs outbound internet access to Google's TTS
 > endpoint. On a RunPod pod that works; on an air-gapped host use `mode=seamless`,
 > which is fully local.
+>
+> **Cost control:** synthesised speech is cached by (language, text) under
+> `EVAL_TTS_CACHE_DIR`, so a repeated translation is free and deterministic.
+> Speech APIs bill per *generation request*, not per download, so without the
+> cache every re-run of the pipeline re-pays for the same audio.
 
 ### 6.6 `POST /evaluate`
 

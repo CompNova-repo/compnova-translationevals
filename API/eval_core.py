@@ -30,6 +30,7 @@ os.environ["USE_TF"] = "NO"
 os.environ["USE_JAX"] = "NO"
 
 import functools
+import hashlib
 import json
 import logging
 import struct
@@ -1130,12 +1131,37 @@ def translate_text(source_text: str, target_lang: str) -> str:
 
 
 def synthesize_speech(text: str, target_lang: str) -> str:
-    """Synthesise speech with gTTS. Returns the path to an mp3 file."""
+    """Synthesise speech, with a content-addressed cache.
+
+    Speech APIs bill per *generation request*, not per download, so a pipeline
+    that re-synthesises on every run pays for the same audio over and over.
+    The cache is keyed on (language, text), so a repeated translation is free
+    and deterministic - and it is the single biggest TTS cost control we have.
+
+    Returns the path to an mp3 file. Cached files live in
+    `EVAL_TTS_CACHE_DIR` and must not be deleted by the caller.
+    """
     from gtts import gTTS
 
     tts_lang = TTS_LANG_MAP.get(normalise_language(target_lang), "en")
+    try:
+        os.makedirs(config.TTS_CACHE_DIR, exist_ok=True)
+        digest = hashlib.sha256(f"{tts_lang}|{text}".encode("utf-8")).hexdigest()[:24]
+        cached = os.path.join(config.TTS_CACHE_DIR, f"tts_{digest}.mp3")
+        if os.path.exists(cached) and os.path.getsize(cached) > 0:
+            return cached
+    except OSError as exc:
+        LOG.warning("TTS cache unavailable (%s) - synthesising directly", exc)
+        cached = None
+
     out = f"/tmp/compnova_tts_{uuid.uuid4().hex[:12]}.mp3"
     gTTS(text=text, lang=tts_lang).save(out)
+    if cached:
+        try:
+            os.replace(out, cached)   # atomic publish
+            return cached
+        except OSError as exc:
+            LOG.warning("could not publish TTS cache entry (%s)", exc)
     return out
 
 
@@ -1203,7 +1229,8 @@ def translate_audio(source_path: str, target_lang: str, mode: str = "cascaded") 
     translated = translate_text(source_text, target)
     mp3_path = synthesize_speech(translated, target)
     wav_path = _to_wav_16k(mp3_path)
-    if wav_path != mp3_path:
+    if wav_path != mp3_path and not mp3_path.startswith(config.TTS_CACHE_DIR):
+        # cached entries are reused, so they must not be deleted
         try:
             os.remove(mp3_path)
         except OSError:

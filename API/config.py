@@ -8,6 +8,7 @@ RunPod setup script relies on.
 """
 import os
 import shutil
+import tempfile
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -168,6 +169,13 @@ AUDIO_QUALITY_MAX_DOMINANT_RATIO = _env_float("EVAL_AUDIO_QUALITY_MAX_DOMINANT_R
 AUDIO_QUALITY_MAX_OVERLAP_RATIO = _env_float("EVAL_AUDIO_QUALITY_MAX_OVERLAP_RATIO", 0.15)
 
 # -------------------------------------------------------------- translation --
+
+# Where synthesised speech is cached, keyed on (language, text). Speech APIs
+# bill per generation request, so re-synthesising on every run is the single
+# biggest waste in a TTS pipeline.
+TTS_CACHE_DIR = os.environ.get("EVAL_TTS_CACHE_DIR", "").strip() or os.path.join(
+    tempfile.gettempdir(), "compnova_tts_cache",
+)
 
 # The translation models (NLLB-200, SeamlessM4T) are only loaded when
 # /translate is actually called, so a deployment that only evaluates never

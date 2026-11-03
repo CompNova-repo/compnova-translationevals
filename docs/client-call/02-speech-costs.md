@@ -20,7 +20,7 @@ She is right about the *shape* of the cost and slightly wrong about *where* it l
   ever need to clean audio in bulk (background noise, see
   `01-noisy-and-multispeaker-audio.md`), a per-minute API
   (ElevenLabs Voice Isolator is **$0.12/min = $7.20 per hour of audio**) is
-  untenable, while the same job on the GPU we already rent is ~150× cheaper.
+  untenable, while the same job on the GPU we already rent is ~100× cheaper.
 
 ## What ElevenLabs actually charges today
 
@@ -63,6 +63,66 @@ The ladder is the ERP trap she is describing: **credits reset monthly and do not
 roll over**, the plan you need is set by your *worst* month, and the volume
 price ("as low as 5c/minute") only starts at $990/month.
 
+> **The API tiers are prepaid list price, not a discount.** Every tier works out
+> to the same $0.08/1k characters — only an Enterprise contract ("significant
+> discounts at scale") beats it. If anyone is spending more than ~$5k/month on
+> ElevenLabs, get a quote before switching vendors.
+
+### What the competitors charge (same day, same units)
+
+| Provider | Product | Price | $/1M chars |
+|---|---|---|---|
+| **Azure** | Neural | $15 | $15 |
+| **Deepgram** | Aura-1 | $15 | $15 |
+| **AWS** | Polly Neural | $16 | $16 |
+| **Google** | Neural2 | $16 | $16 |
+| **Nari Labs** | hosted Qwen3-TTS | $5 | $5 |
+| **Speechify** | Simba 3.5 | $6–20 (launch ends 21 Nov 2026) | $6–20 |
+| **Deepgram** | Aura-2 | $30 | $30 |
+| **Google** | Chirp 3 HD | $30 | $30 |
+| **Cartesia** | Sonic-3.6 | $37–50 | $37–50 |
+| **ElevenLabs** | v4 / v3 / v2-mtl | $80 | $80 |
+| **ElevenLabs** | v4 Turbo / Flash | $40 | $40 |
+
+So ElevenLabs is **5.3×** Azure Neural, and a hosted open model (Nari, Qwen3-TTS)
+is **16×** cheaper.
+
+### And the ASR we would replace, for reference
+
+| Provider | Model | Price |
+|---|---|---|
+| OpenAI | gpt-4o-mini-transcribe | $0.003 / min |
+| Deepgram | Nova-3 | $0.0077 / min (+$0.002 for diarization) |
+| Google | STT v2 standard | $0.016 / min |
+| Azure | batch / fast / real-time | $0.225 / $0.36 / $1.20 per hour |
+| ElevenLabs | Scribe v2 | **$0.22 / hour** |
+
+Scribe v2 at $0.22/hour is ~5× cheaper than Azure real-time and ~2× cheaper than
+Google STT — the inversion that surprises people. For our volume, self-hosted
+Whisper is still ~20× cheaper than all of them.
+
+### Quality: where the money actually buys something
+
+Independent leaderboard (Artificial Analysis, provider-voice board, retrieved
+2026-11-03):
+
+| Model | Elo | Note |
+|---|---|---|
+| **Eleven v4** | **1334 ±15** | best on the board |
+| **Eleven v4 Turbo** | **1331 ±16** | **the same quality as v4, at half the price** |
+| Qwen-Audio TTS (hosted open model) | 1301 ±15 | best non-ElevenLabs |
+| Cartesia Sonic 3.6 | 1293 ±13 | |
+| Google Gemini Flash TTS | 1282 ±13 | |
+| Speechify Simba 3.2 | 1244 ±12 | |
+| Azure HD 2.5 | 1143 ±11 | |
+| Chatterbox HD | 1108 ±12 | |
+| Kokoro-82M | 1061 ±11 | what self-hosting actually buys you |
+
+Two things to take from this: **v4 Turbo is v4's quality at half the price**, and
+the gap between the best hosted model and the open weights you would self-host is
+**~250 Elo** — decisive. So "swap ElevenLabs for a self-hosted model" is *not* a
+free 150× saving; it is a real quality drop that you have to decide to accept.
+
 ## Where TTS sits in our product — and where it does not
 
 ```
@@ -102,29 +162,74 @@ Regenerate with `python3 docs/client-call/tts_unit_economics.py`.
 | ElevenLabs v4 | **$0.0720** | $0.08 / 1k chars |
 | ElevenLabs Flash/Turbo | $0.0360 | $0.04 / 1k chars |
 | ElevenLabs Voice Isolator (denoise) | **$0.1200** | $0.12 / min |
-| Self-hosted TTS on an A6000/A40 48 GB pod ($0.59/hr) at 20× realtime | $0.00049 | — |
-| Self-hosted TTS on the same pod at 50× realtime | $0.00020 | — |
+| Azure Neural (hosted API) | $0.0150 | $15 / 1M chars |
+| AWS Polly Neural / Google Neural2 | $0.0160 | $16 / 1M chars |
+| Nari (hosted Qwen3-TTS) | $0.0050 | $5 / 1M chars |
+| Self-hosted TTS on an RTX A6000 48 GB pod ($0.33/hr) at 20× realtime | $0.00028 | — |
+| Self-hosted TTS on the same pod at 50× realtime | $0.00011 | — |
 
 > The self-hosted rows are **estimates**: they assume an open TTS model
 > (Chatterbox, CosyVoice2, Qwen3-TTS) generating audio 20–50× faster than real
 > time on a 48 GB GPU. Measure it on the pod before quoting it. The order of
-> magnitude is what matters: ~150× cheaper than ElevenLabs per minute.
+> magnitude is what matters: ~700× cheaper per minute, but self-hosting
+> carries a fixed monthly cost - see the break-even below.
 
 ### Cost of one evaluation job (5-minute files)
 
 | Setup | TTS | scoring | total | TTS share |
 |---|---|---|---|---|
-| A6000 48 GB · ElevenLabs v4 | $0.3600 | $0.0103 | **$0.3703** | 97% |
-| A6000 48 GB · ElevenLabs Flash/Turbo | $0.1800 | $0.0103 | $0.1903 | 95% |
-| A6000 48 GB · self-hosted TTS | $0.0010 | $0.0103 | **$0.0113** | 9% |
+| ElevenLabs v4 | $0.4000 | $0.0103 | **$0.4103** | 97% |
+| ElevenLabs v4 Turbo / Flash | $0.2000 | $0.0103 | $0.2103 | 95% |
+| Azure Neural (hosted) | $0.0750 | $0.0103 | $0.0853 | 88% |
+| Self-hosted TTS on the pod we already rent | $0.0010 | $0.0103 | **$0.0113** | 9% |
 
 ### Monthly bill
 
-| jobs / month | GPU hours | ElevenLabs v4 | ElevenLabs Flash/Turbo | Self-hosted TTS |
+| jobs / month | GPU hours | ElevenLabs v4 | ElevenLabs Flash/Turbo | Self-hosted TTS (incl. fixed) |
 |---|---|---|---|---|
-| 1,000 | 18 | $370 | $190 | $11 |
-| 10,000 | 175 | $3,703 | $1,903 | $113 |
-| 100,000 | 1,750 | $37,033 | $19,033 | $1,131 |
+| 1,000 | 18 | $406 | $206 | $3,033 |
+| 10,000 | 175 | $4,058 | $2,058 | $3,268 |
+| 100,000 | 1,750 | $40,578 | $20,578 | $4,648 |
+
+### Where self-hosting actually wins
+
+Per minute, self-hosting is ~700× cheaper than ElevenLabs. It is not free,
+though: one always-on GPU (~$1,015/month) plus ops labour (~$2,000/month)
+is a **$3,015/month fixed cost**. So:
+
+| Comparison | Break-even |
+|---|---|
+| self-hosted vs ElevenLabs v4 | ~7,500 jobs/month |
+| self-hosted vs ElevenLabs v4 Turbo | ~15,000 jobs/month |
+| self-hosted vs Azure Neural (the cheap-API hybrid) | ~40,000 jobs/month |
+
+**Below ~7,500 jobs/month, do not self-host.** Switch the bulk synthesis to a
+cheap hosted API (Azure Neural / Google Neural2 / AWS Polly Neural at $15–16 per
+1M characters) — it costs nothing to operate and is still 5× cheaper than
+ElevenLabs. Self-hosting's real advantages are privacy, latency and voice-cloning
+control, not unit price.
+
+## The trap that costs more than the price
+
+**ElevenLabs charges credits per *generation request*, not per download** (their
+own pricing FAQ). So re-running the pipeline re-bills the whole corpus: at 100k
+jobs/month, **one** full re-run costs $40,000 (v4) or $20,000 (Turbo). If the
+team re-scores on every metric-version bump, or generates N candidate
+syntheses per file, the bill is N × $20–40k/month.
+
+The fix is not a different vendor, it is a **content-addressed cache** keyed on
+(target_text, voice_id, model, params, seed). That typically removes 50–90% of
+TTS spend and is worth doing first.
+
+**We have already built it.** The cascaded translate path now caches synthesised
+speech by (language, text) in `EVAL_TTS_CACHE_DIR`, so a repeated translation is
+free, deterministic, and never re-bills the speech API (`API/eval_core.synthesis`,
+tests in `API/test_synthesis_cache.py`).
+
+The other half of that story: `gTTS` — what we use today — is free but hits
+Google's *unofficial* endpoint, is low quality, gets rate-limited, and is not
+something to build a paid product on. Replacing it is on the roadmap, with the
+price table above deciding which engine.
 
 RunPod pod prices used above (page dated 28 Oct 2026):
 RTX A6000 48 GB **$0.59/hr**, A40 48 GB $0.59, L40S 48 GB $1.09,
@@ -177,24 +282,49 @@ Options, in order of preference:
 |---|---|---|
 | Scoring client audio | no TTS at all | the target audio is the client's; also avoids circularity |
 | Demos, onboarding, "listen to our Spanish" | **ElevenLabs v4** — but cap the volume | the quality is what the client is reacting to; a demo month is a few dollars, and this is where perception is bought |
-| The cascaded translate path at volume | **self-hosted** open TTS on the pod you already pay for | MIT/Apache-2.0 models cost ~150× less per minute and the GPU is already running |
+| The cascaded translate path at volume | a cheap hosted API (Azure Neural $15/1M) until ~7,500 jobs/month, then **self-hosted** open TTS | 5× cheaper than ElevenLabs with zero ops; self-hosting is ~700× cheaper per minute but carries $3,015/month of fixed cost |
 | Bulk noise/voice cleanup | **self-hosted** (Demucs v4 / Resemble Enhance) | $0.12/min APIs do not survive an ERP review |
 | If the client already pays ElevenLabs | ask them to send us *their* target audio | then we never generate anything, and we score the voice they already chose |
 
 ### Open models that are actually usable commercially
 
-| Model | License | Note |
-|---|---|---|
-| Chatterbox (Resemble AI) | MIT | voice cloning, English; RunPod's public endpoint lists it at $0.00/1k chars |
-| CosyVoice2 | Apache-2.0 | multilingual, strong on Chinese/English |
-| Qwen3-TTS | Apache-2.0 (check weights) | many languages, cloning |
-| Kokoro-82M | Apache-2.0 | very light, no cloning, lower quality |
-| F5-TTS | MIT (code) / non-commercial weights | check before shipping |
-| Coqui XTTS-v2 | CPML — **non-commercial** | do not ship it in a paid product |
-| Fish Speech | weights have a non-commercial clause | do not ship it in a paid product |
+| Model | Code / weights licence | Commercial in a paid product? | Note |
+|---|---|---|---|
+| **Chatterbox** (Resemble AI) | MIT / MIT | **yes** | 23+ languages; Turbo 350 M (low VRAM), Nano 110 M runs 3× realtime on 8 CPU cores |
+| **CosyVoice2** | Apache-2.0 / Apache-2.0 | **yes** | 9 languages incl. Spanish; bi-streaming, latency as low as ~150 ms; zero-shot cloning |
+| **Qwen3-TTS** | Apache-2.0 / Apache-2.0 | **yes** | 10 languages incl. Spanish; ~97 ms synthesis latency, 10 RPS on one H100 |
+| **Kokoro-82M** | Apache-2.0 / Apache-2.0 | **yes** | 82 M params, CPU-friendly, Spanish voice included; lowest quality (Elo ~1061) |
+| **Piper** | MIT / MIT | **yes** | CPU, very fast, low fidelity |
+| **Sesame CSM** | Apache-2.0 | **yes** | English only |
+| **Orpheus** | Apache-2.0 (English weights) | English only | multilingual set is a "research release" — check terms |
+| F5-TTS | MIT code / **CC-BY-NC-4.0** weights | **no** | the pre-trained weights are NC because of the Emilia training data |
+| Coqui XTTS-v2 | MPL-2.0 code / **CPML — non-commercial** | **no** | "allows only non-commercial use of the model and its outputs" |
+| Fish Speech | Fish Audio Community License | **no, as a hosted service** | commercial use only below $500k revenue **and** "no license is granted to offer a Hosted Service" — that is exactly our product shape |
 
 > Verify each licence before it goes into a paid product — the distinction between
-> "code is MIT" and "the weights you download are MIT" is where teams get burned.
+> "the code is MIT" and "the weights you download are MIT" is where teams get burned.
+> Fish Speech is the nastiest one: it is the model people reach for when they want
+> multilingual cloning, and its licence forbids precisely what we would do with it.
+
+## The five-day experiment that settles it
+
+Nobody outside this repo can tell us which TTS is "good enough" for our product,
+because the metric that matters is ours: **how much does the TTS layer move the
+scores we sell?** Five working days, one gold set:
+
+1. Build a **100-file Spanish gold set** — real client-style recordings plus human
+   reference translations.
+2. Generate the target side four ways: (a) ElevenLabs v4, (b) ElevenLabs v4
+   Turbo, (c) Azure Neural, (d) Qwen3-TTS self-hosted.
+3. Measure what we actually sell on: **ASR WER of the TTS output against the
+   reference transcript**, the **COMET/MetricX deltas** the TTS layer introduces,
+   and a **blind listening test** (n ≥ 30 pairs).
+4. If (c) or (d) lands inside our tolerance, the CTO's argument is *proven*, we
+   keep ~80% of the saving, and we show a chart instead of an assertion.
+
+That experiment is also the answer to "is ElevenLabs worth it?" — it is the only
+way to find out whether the quality gap we are paying for matters for our metric
+rather than for a demo.
 
 ## Questions to ask her (this is what her sentence is really missing)
 

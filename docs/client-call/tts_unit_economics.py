@@ -22,6 +22,18 @@ ELEVENLABS_SCRIBE_V2_PER_HOUR = 0.22       # speech-to-text
 ELEVENLABS_VOICE_ISOLATOR_PER_MIN = 0.12   # background-noise removal
 ELEVENLABS_DUBBING_V1_PER_MIN = 0.33
 
+# Competing hosted TTS, per 1M characters (Nov 2026). Sources in the doc.
+COMPETITOR_PER_1M_CHARS = {
+    "Azure Neural": 15.0,
+    "AWS Polly Neural": 16.0,
+    "Google Neural2": 16.0,
+    "Deepgram Aura-1": 15.0,
+    "Deepgram Aura-2": 30.0,
+    "Google Chirp 3 HD": 30.0,
+    "Cartesia Sonic-3.6": 40.0,
+    "Nari (hosted Qwen3-TTS)": 5.0,
+}
+
 # ElevenLabs subscriptions, https://elevenlabs.io/pricing (Nov 2026)
 ELEVENLABS_PLANS = {
     # plan: (usd per month, credits per month)
@@ -34,19 +46,26 @@ ELEVENLABS_PLANS = {
 }
 
 # RunPod pod pricing, https://www.runpod.io/pricing (page dated Oct 28 2026)
+# The Community Cloud tab is cheaper than Secure Cloud; both are listed.
 RUNPOD_PODS_PER_HOUR = {
-    "RTX A6000 48GB": 0.59,
-    "A40 48GB": 0.59,
-    "L40S 48GB": 1.09,
-    "A100 80GB": 1.79,
-    "H100 80GB": 3.99,
+    "RTX A6000 48GB": 0.33,
+    "A40 48GB": 0.35,
+    "L40S 48GB": 0.79,
+    "A100 80GB": 1.39,
+    "H100 80GB": 2.69,
 }
+
+# Fixed cost of running our own TTS stack: one always-on GPU plus the ops
+# labour to keep it patched and monitored. These are assumptions - replace
+# them with our real numbers before quoting anyone.
+SELF_HOST_FIXED_COST_PER_MONTH = 1015.0   # one A100 at $1.39/hr x 730 h
+SELF_HOST_OPS_PER_MONTH = 2000.0
 
 # --------------------------------------------------------------------------- #
 # workload assumptions
 # --------------------------------------------------------------------------- #
 
-CHARS_PER_MINUTE_OF_SPEECH = 900   # ~15 words/second, 5.4 chars/word + spaces
+CHARS_PER_MINUTE_OF_SPEECH = 1000   # ElevenLabs' own convention on its pricing page
 SECONDS_OF_AUDIO_PER_HOUR = 3600
 
 
@@ -134,10 +153,16 @@ def main() -> None:
         ["ElevenLabs Voice Isolator (noise removal)",
          fmt_money(ELEVENLABS_VOICE_ISOLATOR_PER_MIN), "$0.12 / min"],
     ]
+    for name, per_1m in COMPETITOR_PER_1M_CHARS.items():
+        rows.append([
+            f"{name} (hosted API)",
+            fmt_money(per_1m / 1000.0 * (CHARS_PER_MINUTE_OF_SPEECH / 1000.0)),
+            f"${per_1m:.0f} / 1M chars",
+        ])
     for gpu, price in RUNPOD_PODS_PER_HOUR.items():
         for rtf in (20, 50):
             rows.append([
-                f"Self-hosted TTS on {gpu} ({rtf}x realtime)",
+                f"Self-hosted TTS on {gpu} (${price:.2f}/hr, {rtf}x realtime)",
                 fmt_money(self_hosted_cost_per_hour_audio(price, rtf) / 60.0),
                 f"${price:.2f} / gpu-hour",
             ])
@@ -169,38 +194,65 @@ def main() -> None:
     for jobs in (1_000, 10_000, 100_000):
         eleven = monthly(jobs, job_minutes,
                           elevenlabs_cost_per_minute_audio(ELEVENLABS_V4_PER_1K_CHARS),
-                          0.59, evaluation_seconds)
+                          0.33, evaluation_seconds)
         turbo = monthly(jobs, job_minutes,
                         elevenlabs_cost_per_minute_audio(ELEVENLABS_TURBO_PER_1K_CHARS),
-                        0.59, evaluation_seconds)
+                        0.33, evaluation_seconds)
         own = monthly(jobs, job_minutes,
-                      self_hosted_cost_per_hour_audio(0.59, 50) / 60.0,
-                      0.59, evaluation_seconds)
+                      self_hosted_cost_per_hour_audio(0.33, 50) / 60.0,
+                      0.33, evaluation_seconds)
+        own_total = own["monthly_total"] + (
+            SELF_HOST_FIXED_COST_PER_MONTH + SELF_HOST_OPS_PER_MONTH)
         rows.append([
             f"{jobs:,}",
             f"{eleven['gpu_hours']:.0f}",
             fmt_money(eleven["monthly_total"]),
             fmt_money(turbo["monthly_total"]),
-            fmt_money(own["monthly_total"]),
+            fmt_money(own_total),
             f"{eleven['monthly_tts'] / eleven['monthly_total'] * 100:.0f}%",
         ])
     print(table(rows, ["jobs / month", "GPU hours", "ElevenLabs v4",
-                       "ElevenLabs Flash/Turbo", "Self-hosted TTS",
+                       "ElevenLabs Flash/Turbo", "Self-hosted TTS (incl. fixed)",
                        "TTS share of the bill (v4)"]))
     print()
 
     print("## Break-even: when is self-hosting cheaper than ElevenLabs v4?\n")
     tts_rate = elevenlabs_cost_per_minute_audio(ELEVENLABS_V4_PER_1K_CHARS)
-    own_rate = self_hosted_cost_per_hour_audio(0.59, 50) / 60.0
+    own_rate = self_hosted_cost_per_hour_audio(0.33, 50) / 60.0
+    azure_rate = COMPETITOR_PER_1M_CHARS["Azure Neural"] / 1000.0 * (
+        CHARS_PER_MINUTE_OF_SPEECH / 1000.0)
     ratio = tts_rate / own_rate
     print(f"- ElevenLabs v4 costs {fmt_money(tts_rate)} per audio minute; "
-          f"self-hosted costs {fmt_money(own_rate)}.")
-    print(f"- Self-hosting is {ratio:.0f}x cheaper per minute, so it wins at "
-          f"**every** volume - the crossover is the first job.")
-    print("- The real comparison is not the per-minute rate but the *commitment*:")
-    print("  ElevenLabs is billed as credits on a monthly plan (Starter $6 -> "
-          "Business $990) or pay-as-you-go, and the price of the plan you need")
-    print("  depends on your worst month, not your average month.")
+          f"self-hosted costs {fmt_money(own_rate)}; "
+          f"Azure Neural costs {fmt_money(azure_rate)}.")
+    print(f"- Per minute, self-hosting is {ratio:.0f}x cheaper than ElevenLabs - "
+          f"but it is not free: it carries a fixed cost of "
+          f"{fmt_money(SELF_HOST_FIXED_COST_PER_MONTH + SELF_HOST_OPS_PER_MONTH)}/month")
+    print("  (one always-on GPU plus the ops labour to keep it patched and monitored).")
+    for label, other_rate in (("ElevenLabs v4", tts_rate),
+                              ("Azure Neural", azure_rate),
+                              ("ElevenLabs v4 Turbo",
+                               elevenlabs_cost_per_minute_audio(ELEVENLABS_TURBO_PER_1K_CHARS))):
+        saved_per_job = job_minutes * (other_rate - own_rate)
+        if saved_per_job <= 0:
+            continue
+        break_even = (SELF_HOST_FIXED_COST_PER_MONTH + SELF_HOST_OPS_PER_MONTH) / saved_per_job
+        print(f"- Self-hosting overtakes {label} at about "
+              f"**{break_even:,.0f} jobs/month**.")
+    print("- Below that, a cheap hosted API (Azure Neural / Google Neural2 / "
+          "AWS Polly Neural at $15-16 per 1M characters) is the better move: it")
+    print("  costs nothing to operate and is still 5x cheaper than ElevenLabs.")
+    print("- Self-hosting's edge is privacy, latency and voice-cloning control - "
+          "not unit price.")
+    print()
+
+    print("## The trap that actually costs money\n")
+    print("ElevenLabs charges credits **per generation request, not per download**")
+    print("(their own pricing FAQ). So re-running the pipeline re-bills the whole")
+    print("corpus. One full re-run at 100k jobs/month costs $40,000 (v4) or")
+    print("$20,000 (Turbo). The fix is a content-addressed cache keyed on")
+    print("(target_text, voice_id, model, params, seed) - typically removes 50-90%")
+    print("of TTS spend, and it is worth doing before switching vendors.")
     print()
 
     print("## ElevenLabs plan ladder (the 'commitment' problem)\n")
