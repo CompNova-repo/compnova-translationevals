@@ -13,12 +13,19 @@ on the team.
 1. In RunPod, make sure the pod exposes HTTP ports **8000** and **8501**
    (set this when creating the pod; changing it later restarts the pod).
 2. Open a terminal on the pod (Connect, then Web Terminal).
-3. If the repo isn't in `/workspace` yet, clone it (use a GitHub token as
-   the password):
+3. If the repo isn't in `/workspace` yet, clone it. **No GitHub account and
+   no personal access token are needed** — the repository is public, so
+   git reads it anonymously:
    ```bash
    cd /workspace
    unset GIT_CONFIG_PARAMETERS
    git clone -b demo/client-call https://github.com/CompNova-repo/compnova-translationevals.git
+   ```
+   If the pod's git is configured to prompt for credentials, keep it
+   anonymous by disabling the helper for that one command:
+   ```bash
+   git -c credential.helper= clone -b demo/client-call \
+       https://github.com/CompNova-repo/compnova-translationevals.git
    ```
 4. Run:
    ```bash
@@ -57,6 +64,9 @@ unset GIT_CONFIG_PARAMETERS
 git pull origin demo/client-call
 bash runpod_start.sh --restart
 ```
+
+Like the clone, the pull is anonymous — no token, no credential helper —
+as long as the repository stays public.
 
 ## What the script does
 
