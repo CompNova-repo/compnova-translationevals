@@ -654,7 +654,7 @@ curl -s -X POST "$BASE/audio/quality" -F "audio=@/data/EN_001.wav"
 |---|---|
 | `off` (default) | No analysis. The behaviour of 2.1 is unchanged. |
 | `flag` | Every result carries an `audio_quality` block and the flags. The score itself is unchanged - nothing is hidden. |
-| `filter` | The transcript and the emotion model only see the dominant speaker's windows, so a background voice in another language cannot contaminate the score. |
+| `filter` | The transcript and the emotion model only see the dominant speaker's words, so a background voice in another language cannot contaminate the score. |
 
 ```json
 "audio_quality": {

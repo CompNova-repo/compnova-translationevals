@@ -101,7 +101,7 @@ Whisper improve the report when installed.
 |---|---|---|
 | `off` (default today) | no change | nothing to do |
 | `flag` | every result carries `audio_quality`; the score is unchanged, but you know which files to distrust | **default recommendation** - it is honest and it is cheap |
-| `filter` | the transcript and the emotion model only see the dominant speaker's turns | when the client's corpus is noisy and they want a number anyway |
+| `filter` | the transcript and the emotion model only see the dominant speaker - **at word level**, so a background sentence inside the target speaker's turn is dropped too | when the client's corpus is noisy and they want a number anyway |
 
 ```bash
 # pre-flight check on one file
@@ -129,8 +129,13 @@ dominant speaker.
 
 ## What the pipeline does with the measurement
 
-- **Transcription.** In `filter` mode only the dominant speaker's windows are sent to
-  Whisper, so the background voice in the other language never enters the transcript.
+- **Transcription.** In `filter` mode Whisper runs with word timestamps, and each
+  word is attributed to a speaker using pyannote's **exclusive** diarization (the
+  non-overlapping annotation, which exists exactly to make diarization timestamps
+  reconcilable with transcription timestamps). Words that belong to somebody else are
+  dropped - including a background sentence that starts inside the target speaker's
+  own turn. A segment whose words are all the target speaker's is kept verbatim, so
+  the transcript is unchanged in the normal case.
 - **Alignment and scoring.** COMET-Kiwi and MetricX-24 score the (filtered) transcript
   pairs, so a background sentence can no longer be scored as if it were an omission
   or a mistranslation.
@@ -146,9 +151,10 @@ dominant speaker.
 - Diarization needs the gated `pyannote/speaker-diarization-3.1` model, so the pod
   needs an `HF_TOKEN` with those terms accepted. Without it the report falls back to
   energy measurements and there is no `speaker_count`.
-- `filter` mode cuts on speaker turns; a chunk that straddles a speaker change can
-  still contain two voices. Word-level speaker attribution (aligning diarization to
-  Whisper word timestamps) is the next step and is on the roadmap.
+- Word-level attribution needs pyannote 4.x's `exclusive_speaker_diarization`. With
+  pyannote 3.1 we fall back to the overlapping turns, which are *not* mutually
+  exclusive, so a word can end up attributed to the wrong speaker when two people
+  talk at once. pyannote 4.x is the version to deploy.
 - Diarization can *hurt* recognition (NIST SRE24). We should measure end-to-end WER
   with and without the filter before turning it on for a client.
 - We are not going to claim "we removed the background voice". The honest claim is
@@ -166,6 +172,21 @@ dominant speaker.
 
 Our implementation defaults to `pyannote/speaker-diarization-3.1` (MIT) and can be
 pointed at another model with `EVAL_DIARIZATION_MODEL`.
+
+**Upgrade path:** `nvidia/Nemotron-3-Diarization` (Sept 2026) is the best open option
+— DER 12.73 on DIHARD3-full vs 19.09 for the baseline, 11.14 on AMI-SDM vs 21.42,
+6.77 on NOTSOFAR1 — and it is licensed OpenMDW-1.1, *"ready for commercial or
+non-commercial use"*. It needs NeMo (`nemo-toolkit`), and it is roughly an order of
+magnitude faster, which matters when a batch job processes hundreds of files.
+
+**Also worth reading before building tier 2:** `gaspardpetit/verbatim` (MIT) is a
+production-shaped implementation of the whole pattern — diarization, Demucs voice
+isolation, per-window language detection and word confidences.
+
+**Multilingual embeddings:** if the background speakers are Chinese or Spanish, a
+VoxCeleb-only speaker embedding is the weakest choice. 3D-Speaker's ERes2NetV2 /
+CAM++ (trained on Mandarin CNCeleb) or NeMo's models are the ones to prefer for
+cross-language material.
 
 ## How to answer if she pushes for separation
 

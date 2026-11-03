@@ -291,8 +291,15 @@ def _diarization_pipeline(model_id: str | None = None):
         return None
 
 
-def diarize(path: str, model_id: str | None = None) -> list[tuple[float, float, str]] | None:
-    """Return (start, end, speaker) turns, or None when diarization is unavailable."""
+def _diarize_full(path: str, model_id: str | None = None) -> dict | None:
+    """Run diarization and return both the overlapping and the exclusive turns.
+
+    `exclusive` comes from pyannote 4.x's `exclusive_speaker_diarization`
+    annotation - the same diarization without overlapping segments, which
+    exists precisely to make diarization timestamps reconcilable with
+    transcription timestamps. When the pipeline does not provide it (older
+    pyannote), we fall back to the overlapping turns.
+    """
     pipeline = _diarization_pipeline(model_id)
     if pipeline is None:
         return None
@@ -302,13 +309,43 @@ def diarize(path: str, model_id: str | None = None) -> list[tuple[float, float, 
         with torch.no_grad():
             annotation = pipeline(path)
         turns = []
-        for turn in annotation.itertracks(yield_label=True):
-            start, end, label = turn
+        for start, end, label in annotation.itertracks(yield_label=True):
             turns.append((float(start), float(end), str(label)))
-        return turns
+        exclusive = []
+        exclusive_annotation = getattr(annotation, "exclusive_speaker_diarization", None)
+        if exclusive_annotation is not None:
+            for start, end, label in exclusive_annotation.itertracks(yield_label=True):
+                exclusive.append((float(start), float(end), str(label)))
+        return {
+            "turns": turns,
+            "exclusive": exclusive or turns,
+            "has_exclusive": bool(exclusive),
+        }
     except Exception as exc:
         LOG.info("diarization failed on %s: %s", path, exc)
         return None
+
+
+def diarize(path: str, model_id: str | None = None) -> list[tuple[float, float, str]] | None:
+    """Return (start, end, speaker) turns, or None when diarization is unavailable."""
+    data = _diarize_full(path, model_id)
+    return data["turns"] if data else None
+
+
+def speaker_of(start: float, end: float,
+               turns: list[tuple[float, float, str]]) -> str | None:
+    """The speaker whose turn overlaps [start, end] the most.
+
+    With exclusive turns this is deterministic - no two turns overlap - so a
+    word can be attributed to exactly one speaker.
+    """
+    best_label, best_overlap = None, 0.0
+    for turn_start, turn_end, label in turns:
+        overlap = min(end, turn_end) - max(start, turn_start)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_label = label
+    return best_label
 
 
 # --------------------------------------------------------------------------- #
@@ -458,7 +495,8 @@ def analyze(path: str, *,
         result["speech_intervals"] = [(round(a, 3), round(b, 3)) for a, b in silero]
 
     # --- layer 2: diarization attributes the speech to speakers --------- #
-    turns = diarize(path) if use_diarization else None
+    diar = _diarize_full(path) if use_diarization else None
+    turns = diar["turns"] if diar else None
     if turns:
         stats = speaker_statistics(turns, duration_s)
         result.update({
@@ -470,9 +508,12 @@ def analyze(path: str, *,
             "speaker_durations_s": stats["speaker_durations_s"],
             "speech_ratio": stats["speech_ratio"],
             "detector": "diarization",
+            "exclusive_diarization": bool(diar.get("has_exclusive")),
         })
         result["_turns"] = turns
-        result["_windows"] = dominant_speaker_windows(turns, stats["dominant_speaker"])
+        result["_exclusive"] = diar["exclusive"]
+        result["_windows"] = dominant_speaker_windows(
+            diar["exclusive"], stats["dominant_speaker"])
 
     # --- layer 3: languages --------------------------------------------- #
     if known_languages:
@@ -572,3 +613,29 @@ def public(report: dict) -> dict:
 def dominant_windows(report: dict) -> list[tuple[float, float]]:
     """The dominant-speaker windows of a report (empty when unavailable)."""
     return report.get("_windows") or []
+
+
+def keep_dominant_words(words, exclusive_turns, dominant: str | None):
+    """Keep only the words that belong to `dominant`.
+
+    `words` is an iterable of (start, end, text). A word with no diarization
+    turn covering it is kept - better to score an unattributed word than to
+    silently drop content.
+    """
+    if not exclusive_turns or not dominant:
+        return list(words)
+    kept = []
+    for start, end, text in words:
+        label = speaker_of(start, end, exclusive_turns)
+        if label is None or label == dominant:
+            kept.append((start, end, text))
+    return kept
+
+
+def exclusive_turns(report: dict) -> list[tuple[float, float, str]]:
+    """The non-overlapping diarization turns of a report.
+
+    pyannote 4.x returns these as `exclusive_speaker_diarization`; they are
+    what makes word-level speaker attribution deterministic.
+    """
+    return report.get("_exclusive") or report.get("_turns") or []

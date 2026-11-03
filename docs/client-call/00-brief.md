@@ -18,7 +18,8 @@ One page. Everything here is backed by a document in this folder.
    *background* speech. A contaminated file is reported as contaminated instead of
    quietly getting a wrong score.
 3. **We score the intended speaker when asked.** With diarization we keep the
-   dominant speaker's turns and compute the score on that audio only.
+   dominant speaker's **words** — word-level, so a background sentence inside the
+   target speaker's own turn is dropped too — and compute the score on that audio only.
 
 ### What to show them
 

@@ -237,11 +237,21 @@ Still open inside this area:
   `HF_TOKEN` with the model terms accepted before `speaker_count` is real.
   Without it the report falls back to energy measurements and
   `speaker_count` is absent.
-* The `filter` mode currently cuts the dominant speaker's windows and
-  re-transcribes them; it does not yet align speaker labels to Whisper word
-  timestamps, so a chunk that straddles a speaker change can still mix voices.
+* Word-level speaker attribution needs pyannote **4.x**, which returns the
+  `exclusive_speaker_diarization` annotation (the same diarization without
+  overlapping segments, so a word maps to exactly one speaker). On pyannote 3.1
+  the overlapping turns are used and a word can be mis-attributed while two
+  people talk at once.
+* The `filter` mode needs a measurement of its own: NIST SRE24 found that
+  top-ranked systems often avoided diarization because it *degraded* recognition.
+  Measure end-to-end WER with and before enabling it for a customer.
 * Overlapping speech (two people at once) is measured but not resolved - the
   score for such a file should be treated as unreliable.
+* The accuracy upgrade is `nvidia/Nemotron-3-Diarization` (OpenMDW-1.1,
+  commercial use OK): DER 12.73 on DIHARD3-full vs 19.09, and roughly an order
+  of magnitude faster. It needs `nemo-toolkit`. Note that the older
+  `nvidia/diar_sortformer_4spk-v1` is **CC-BY-NC-4.0** and cannot ship in a
+  paid product.
 
 ---
 

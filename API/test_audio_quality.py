@@ -158,12 +158,16 @@ def test_multi_speaker_flag(tmp: str) -> None:
     print("\n== multi-speaker flagging ==")
     path = write_wav(os.path.join(tmp, "two.wav"), two_speaker_recording(8.0))
     # Stub the diarization layer with known turns.
-    original = aq.diarize
-    aq.diarize = lambda p, model_id=None: [(0.0, 4.0, "A"), (4.0, 8.0, "B")]
+    original = aq._diarize_full
+    aq._diarize_full = lambda p, model_id=None: {
+        "turns": [(0.0, 4.0, "A"), (4.0, 8.0, "B")],
+        "exclusive": [(0.0, 4.0, "A"), (4.0, 8.0, "B")],
+        "has_exclusive": True,
+    }
     try:
         report = aq.analyze(path, use_diarization=True, use_language_id=False)
     finally:
-        aq.diarize = original
+        aq._diarize_full = original
     check("multi speaker is flagged", "multi_speaker" in report["flags"],
           str(report["flags"]))
     check("the file is marked as contaminated", report["contaminated"] is True,
@@ -186,6 +190,28 @@ def test_window_extraction(tmp: str) -> None:
               str(dur))
     check("cut_windows returns None without windows",
           aq.cut_windows(path, []) is None)
+
+
+def test_speaker_attribution() -> None:
+    print("\n== speaker attribution ==")
+    exclusive = [(0.0, 4.0, "A"), (4.0, 8.0, "B")]
+    check("a word inside speaker A's turn is attributed to A",
+          aq.speaker_of(1.0, 1.5, exclusive) == "A")
+    check("a word inside speaker B's turn is attributed to B",
+          aq.speaker_of(5.0, 5.5, exclusive) == "B")
+    check("a word outside every turn is unattributed",
+          aq.speaker_of(20.0, 21.0, exclusive) is None)
+
+    words = [(0.5, 0.8, "hello"), (1.0, 1.4, "there"),
+             (4.2, 4.6, "buenos"), (4.8, 5.2, "dias")]
+    kept = aq.keep_dominant_words(words, exclusive, "A")
+    check("the other speaker's words are dropped",
+          [w[2] for w in kept] == ["hello", "there"],
+          str([w[2] for w in kept]))
+    check("an unattributed word is kept rather than dropped",
+          len(aq.keep_dominant_words([(20.0, 20.2, "hm")], exclusive, "A")) == 1)
+    check("without turns every word is kept",
+          len(aq.keep_dominant_words(words, [], "A")) == 4)
 
 
 def test_report_shape(tmp: str) -> None:
@@ -237,6 +263,7 @@ def main() -> int:
         test_speaker_statistics()
         test_multi_speaker_flag(tmp)
         test_window_extraction(tmp)
+        test_speaker_attribution()
         test_report_shape(tmp)
         test_config_switches()
 
