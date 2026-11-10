@@ -1,5 +1,7 @@
 # COMET score on the gold English–Spanish audio pair
 
+> Historical diagnosis of the pre-fix pipeline. Implementation details, test commands, and the remaining model-validation gate are in [ALIGNMENT_DEBUGGING.md](ALIGNMENT_DEBUGGING.md).
+
 ## Scope and conclusion
 
 The files [`DRAL_EN_2min.wav`](codebase_eval_pulkit/DRAL_EN_2min.wav) and [`DRAL_ES_2min.wav`](codebase_eval_pulkit/DRAL_ES_2min.wav) are the **gold-standard source and Spanish translation** for this evaluation. The low reported COMET-Kiwi score does not, by itself, establish that the Spanish audio is inaccurate. The preprocessing can send COMET English and Spanish chunks that contain different parts of the conversation.

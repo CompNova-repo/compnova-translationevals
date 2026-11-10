@@ -53,7 +53,7 @@ RUN pip uninstall -y jax jaxlib peft tensorflow tensorflow-cpu keras wandb 2>/de
 RUN git clone https://github.com/google-research/metricx.git /app/metricx \
     && git -C /app/metricx checkout fc4978eb064670f7cc33e93ea4f52d38396b8ae6
 
-COPY eval_core.py api.py ./
+COPY eval_core.py alignment.py eval_store.py api.py ./
 
 EXPOSE 8000
 

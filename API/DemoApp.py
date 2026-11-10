@@ -355,6 +355,11 @@ st.markdown(
     f"evaluated {fmt_time(record.get('created_at'))} (id `{record['id']}`)"
 )
 
+if result.get("summary", {}).get("status") == "review_required":
+    st.warning("Evaluation needs review: " + ", ".join(result["summary"].get("review_reasons", [])))
+    st.caption("Matched-span scores exclude unaligned speech. Check coverage and the trace before interpreting quality.")
+with st.expander("Evaluation trace and parameters"):
+    st.json({k: result.get(k) for k in ("run_id", "parameters", "provenance", "trace")})
 render_summary(result.get("summary"))
 render_chunks(result.get("chunks"))
 render_transcripts(result.get("transcripts"), record["id"])

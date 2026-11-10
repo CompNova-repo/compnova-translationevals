@@ -63,8 +63,10 @@ async def transcribe(
         path = _save_upload(audio)
         segments = eval_core.transcribe_segments(path)
         return {"transcript": eval_core.join_segment_text(segments)}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
         if path and os.path.exists(path):
             os.remove(path)
@@ -79,9 +81,17 @@ async def evaluate(
         description="Minimum semantic similarity for a chunk to count as aligned",
     ),
     max_merge: int = Query(
-        2, ge=1, le=3,
-        description="Max consecutive segments to try merging on each side (2 = allows 1-1, 1-2, 2-1, 2-2)",
+        3, ge=1, le=6,
+        description="Max reconstructed clause units per aligned span",
     ),
+    source_language: str = Query(None, min_length=2, max_length=8),
+    target_language: str = Query(None, min_length=2, max_length=8),
+    debug: bool = Query(False, description="Include candidate table for offline alignment replay"),
+    max_unit_words: int = Query(12, ge=1, le=30),
+    gap_cost: float = Query(0.6, ge=0, le=1),
+    timing_weight: float = Query(0.05, ge=0, le=1),
+    min_coverage: float = Query(0.9, ge=0, le=1),
+    review_similarity: float = Query(0.65, ge=0, le=1),
 ):
     """
     Evaluate a source/translated audio pair end to end:
@@ -99,14 +109,20 @@ async def evaluate(
         src_path = _save_upload(source_audio)
         mt_path = _save_upload(target_audio)
         result = eval_core.evaluate_pair(
-            src_path, mt_path, min_similarity=min_similarity, max_merge=max_merge
+            src_path, mt_path, source_language=source_language, target_language=target_language,
+            debug=debug, config=eval_core.AlignmentConfig(
+                min_similarity=min_similarity, max_merge=max_merge, max_unit_words=max_unit_words,
+                gap_cost=gap_cost, timing_weight=timing_weight, min_coverage=min_coverage,
+                review_similarity=review_similarity)
         )
         eval_id, created_at = save_evaluation(
             result, source_audio.filename, target_audio.filename
         )
         return JSONResponse(content={"id": eval_id, "created_at": created_at, **result})
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
         for p in (src_path, mt_path):
             if p and os.path.exists(p):
